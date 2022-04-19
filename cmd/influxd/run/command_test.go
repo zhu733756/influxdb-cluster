@@ -1,7 +1,6 @@
 package run_test
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,7 +10,7 @@ import (
 )
 
 func TestCommand_PIDFile(t *testing.T) {
-	tmpdir, err := ioutil.TempDir(os.TempDir(), "influxd-test")
+	tmpdir, err := os.MkdirTemp(os.TempDir(), "influxd-test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,6 +32,8 @@ func TestCommand_PIDFile(t *testing.T) {
 			return filepath.Join(tmpdir, "meta")
 		case "INFLUXDB_DATA_WAL_DIR":
 			return filepath.Join(tmpdir, "wal")
+		case "INFLUXDB_HINTED_HANDOFF_DIR":
+			return filepath.Join(tmpdir, "hh")
 		case "INFLUXDB_BIND_ADDRESS", "INFLUXDB_HTTP_BIND_ADDRESS":
 			return "127.0.0.1:0"
 		case "INFLUXDB_REPORTING_DISABLED":
@@ -50,7 +51,9 @@ func TestCommand_PIDFile(t *testing.T) {
 	}
 	go cmd.Close()
 
-	timeout := time.NewTimer(100 * time.Millisecond)
+	// It takes a while for net/http.Server.Shutdown() to run, as it waits for connections to return to idle.
+	// Use a long timeout to allow for this and stop the test flakiness
+	timeout := time.NewTimer(5 * time.Second)
 	select {
 	case <-timeout.C:
 		t.Fatal("unexpected timeout")

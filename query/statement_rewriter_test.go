@@ -169,6 +169,38 @@ func TestRewriteStatement(t *testing.T) {
 			s:    `SHOW TAG KEYS ON db0 WHERE (_name = 'cpu') AND (region = 'uswest')`,
 		},
 		{
+			stmt: `SHOW TAG KEYS WITH KEY = host`,
+			s:    `SHOW TAG KEYS WHERE _tagKey = 'host'`,
+		},
+		{
+			stmt: `SHOW TAG KEYS ON db0 WITH KEY IN (host, region)`,
+			s:    `SHOW TAG KEYS ON db0 WHERE _tagKey = 'host' OR _tagKey = 'region'`,
+		},
+		{
+			stmt: `SHOW TAG KEYS FROM cpu WITH KEY =~ /h.*/`,
+			s:    `SHOW TAG KEYS WHERE (_name = 'cpu') AND (_tagKey =~ /h.*/)`,
+		},
+		{
+			stmt: `SHOW TAG KEYS ON db0 FROM cpu WITH KEY = host`,
+			s:    `SHOW TAG KEYS ON db0 WHERE (_name = 'cpu') AND (_tagKey = 'host')`,
+		},
+		{
+			stmt: `SHOW TAG KEYS FROM /c.*/ WITH KEY = host`,
+			s:    `SHOW TAG KEYS WHERE (_name =~ /c.*/) AND (_tagKey = 'host')`,
+		},
+		{
+			stmt: `SHOW TAG KEYS ON db0 FROM /c.*/ WITH KEY = host`,
+			s:    `SHOW TAG KEYS ON db0 WHERE (_name =~ /c.*/) AND (_tagKey = 'host')`,
+		},
+		{
+			stmt: `SHOW TAG KEYS FROM cpu WITH KEY = host WHERE region = 'uswest'`,
+			s:    `SHOW TAG KEYS WHERE ((_name = 'cpu') AND (region = 'uswest')) AND (_tagKey = 'host')`,
+		},
+		{
+			stmt: `SHOW TAG KEYS ON db0 FROM cpu WITH KEY in (host, region) WHERE region = 'uswest'`,
+			s:    `SHOW TAG KEYS ON db0 WHERE ((_name = 'cpu') AND (region = 'uswest')) AND (_tagKey = 'host' OR _tagKey = 'region')`,
+		},
+		{
 			stmt: `SHOW TAG KEYS FROM mydb.myrp1.cpu`,
 			s:    `SHOW TAG KEYS WHERE _name = 'cpu'`,
 		},
@@ -270,7 +302,11 @@ func TestRewriteStatement(t *testing.T) {
 		},
 		{
 			stmt: `SHOW TAG VALUES FROM cpu WITH KEY = "region"`,
-			s:    `SHOW TAG VALUES WITH KEY = region WHERE (_name = 'cpu') AND (_tagKey = 'region')`,
+			s:    `SHOW TAG VALUES FROM cpu WITH KEY = region WHERE (_name = 'cpu') AND (_tagKey = 'region')`,
+		},
+		{
+			stmt: `SHOW TAG VALUES FROM mydb.myrp1.cpu WITH KEY = "region"`,
+			s:    `SHOW TAG VALUES FROM mydb.myrp1.cpu WITH KEY = region WHERE (_name = 'cpu') AND (_tagKey = 'region')`,
 		},
 		{
 			stmt: `SHOW TAG VALUES WITH KEY != "region"`,

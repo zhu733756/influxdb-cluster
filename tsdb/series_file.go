@@ -366,9 +366,9 @@ func AppendSeriesKey(dst []byte, name []byte, tags models.Tags) []byte {
 }
 
 // ReadSeriesKey returns the series key from the beginning of the buffer.
-func ReadSeriesKey(data []byte) (key, remainder []byte) {
+func ReadSeriesKey(data []byte) (key []byte) {
 	sz, n := binary.Uvarint(data)
-	return data[:int(sz)+n], data[int(sz)+n:]
+	return data[:int(sz)+n]
 }
 
 func ReadSeriesKeyLen(data []byte) (sz int, remainder []byte) {
@@ -414,6 +414,9 @@ func ParseSeriesKeyInto(data []byte, dstTags models.Tags) ([]byte, models.Tags) 
 func parseSeriesKey(data []byte, dst models.Tags) ([]byte, models.Tags) {
 	var name []byte
 	_, data = ReadSeriesKeyLen(data)
+	if len(data) == 0 {
+		return nil, dst
+	}
 	name, data = ReadSeriesKeyMeasurement(data)
 	tagN, data := ReadSeriesKeyTagN(data)
 
@@ -436,17 +439,30 @@ func parseSeriesKey(data []byte, dst models.Tags) ([]byte, models.Tags) {
 
 func CompareSeriesKeys(a, b []byte) int {
 	// Handle 'nil' keys.
-	if len(a) == 0 && len(b) == 0 {
-		return 0
-	} else if len(a) == 0 {
-		return -1
-	} else if len(b) == 0 {
-		return 1
+	// Values below and equal to 1 are considered invalid for key comparisons.
+	nilKeyHandler := func(a, b int) int {
+		if a == 0 && b == 0 {
+			return 0
+		} else if a == 0 {
+			return -1
+		} else if b == 0 {
+			return 1
+		}
+		return a + b
+	}
+
+	keyValidity := nilKeyHandler(len(a), len(b))
+	if keyValidity <= 1 {
+		return keyValidity
 	}
 
 	// Read total size.
-	_, a = ReadSeriesKeyLen(a)
-	_, b = ReadSeriesKeyLen(b)
+	szA, a := ReadSeriesKeyLen(a)
+	szB, b := ReadSeriesKeyLen(b)
+	keySizeValidity := nilKeyHandler(szA, szB)
+	if keySizeValidity <= 1 {
+		return keySizeValidity
+	}
 
 	// Read names.
 	name0, a := ReadSeriesKeyMeasurement(a)

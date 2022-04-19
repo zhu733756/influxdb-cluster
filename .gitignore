@@ -9,6 +9,12 @@ config.json
 
 /query/a.out*
 
+# dev files
+/build/
+/cert/
+/docker-compose.yml
+/Makefile
+
 # ignore generated files.
 cmd/influxd/version.go
 
@@ -83,3 +89,7 @@ man/*.1.gz
 /chronograf
 /http
 /ui
+
+# IDE files
+.idea/
+*.swp

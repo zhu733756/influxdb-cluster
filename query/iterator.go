@@ -43,11 +43,22 @@ func (a Iterators) Stats() IteratorStats {
 }
 
 // Close closes all iterators.
-func (a Iterators) Close() error {
+// We are seeing an occasional panic in this function
+// which looks like a nil reference from one
+// itr.Close() call, thus we check for nil elements
+// in the slice a.  This is often called as error
+// clean-up, so the state of the iterators may be
+// unhappy.
+func (a Iterators) Close() (err error) {
+	err = nil
 	for _, itr := range a {
-		itr.Close()
+		if itr != nil {
+			if e := itr.Close(); e != nil && err == nil {
+				err = e
+			}
+		}
 	}
-	return nil
+	return err
 }
 
 // filterNonNil returns a slice of iterators that removes all nil iterators.
@@ -836,6 +847,10 @@ func (opt IteratorOptions) Window(t int64) (start, end int64) {
 		end = t + dt
 	}
 
+	// As above, the offset has to happen before the time zone calculation.
+	// This is another fix for https://github.com/influxdata/influxdb/issues/20238
+	// that was missed the first time.
+	end += int64(opt.Interval.Offset)
 	// Retrieve the zone offset for the end time.
 	if opt.Location != nil {
 		_, endOffset := opt.Zone(end)
@@ -861,7 +876,6 @@ func (opt IteratorOptions) Window(t int64) (start, end int64) {
 			}
 		}
 	}
-	end += int64(opt.Interval.Offset)
 	return
 }
 

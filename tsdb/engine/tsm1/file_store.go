@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/influxdata/influxdb/models"
@@ -177,9 +178,8 @@ type FileStore struct {
 	currentGeneration int
 	dir               string
 
-	files           []TSMFile
-	tsmMMAPWillNeed bool          // If true then the kernel will be advised MMAP_WILLNEED for TSM files.
-	openLimiter     limiter.Fixed // limit the number of concurrent opening TSM files.
+	files       []TSMFile
+	openLimiter limiter.Fixed // limit the number of concurrent opening TSM files.
 
 	logger       *zap.Logger // Logger to be used for important messages
 	traceLogger  *zap.Logger // Logger to be used when trace-logging is on.
@@ -193,6 +193,10 @@ type FileStore struct {
 	parseFileName ParseFileNameFunc
 
 	obs tsdb.FileStoreObserver
+
+	copyFiles bool
+
+	readerOptions []tsmReaderOption
 }
 
 // FileStat holds information about a TSM file on disk.
@@ -229,7 +233,7 @@ func (f FileStat) ContainsKey(key []byte) bool {
 }
 
 // NewFileStore returns a new instance of FileStore based on the given directory.
-func NewFileStore(dir string) *FileStore {
+func NewFileStore(dir string, options ...tsmReaderOption) *FileStore {
 	logger := zap.NewNop()
 	fs := &FileStore{
 		dir:          dir,
@@ -244,6 +248,8 @@ func NewFileStore(dir string) *FileStore {
 		},
 		obs:           noFileStoreObserver{},
 		parseFileName: DefaultParseFileName,
+		copyFiles:     runtime.GOOS == "windows",
+		readerOptions: options,
 	}
 	fs.purger.fileStore = fs
 	return fs
@@ -486,25 +492,35 @@ func (f *FileStore) Open() error {
 	}
 
 	// find the current max ID for temp directories
-	tmpfiles, err := ioutil.ReadDir(f.dir)
+	tmpfiles, err := os.ReadDir(f.dir)
 	if err != nil {
 		return err
 	}
-	ext := fmt.Sprintf(".%s", TmpTSMFileExtension)
+
+	// ascertain the current temp directory number by examining the existing
+	// directories and choosing the one with the higest basename when converted
+	// to an integer.
 	for _, fi := range tmpfiles {
-		if fi.IsDir() && strings.HasSuffix(fi.Name(), ext) {
-			ss := strings.Split(filepath.Base(fi.Name()), ".")
-			if len(ss) == 2 {
-				if i, err := strconv.Atoi(ss[0]); err != nil {
-					if i > f.currentTempDirID {
-						f.currentTempDirID = i
-					}
-				}
-			}
+		if !fi.IsDir() || !strings.HasSuffix(fi.Name(), "."+TmpTSMFileExtension) {
+			continue
 		}
+
+		ss := strings.Split(filepath.Base(fi.Name()), ".")
+		if len(ss) != 2 {
+			continue
+		}
+
+		i, err := strconv.Atoi(ss[0])
+		if err != nil || i <= f.currentTempDirID {
+			continue
+		}
+
+		// i must be a valid integer and greater than f.currentTempDirID at this
+		// point
+		f.currentTempDirID = i
 	}
 
-	files, err := filepath.Glob(filepath.Join(f.dir, fmt.Sprintf("*.%s", TSMFileExtension)))
+	files, err := filepath.Glob(filepath.Join(f.dir, "*."+TSMFileExtension))
 	if err != nil {
 		return err
 	}
@@ -540,26 +556,36 @@ func (f *FileStore) Open() error {
 			defer f.openLimiter.Release()
 
 			start := time.Now()
-			df, err := NewTSMReader(file, WithMadviseWillNeed(f.tsmMMAPWillNeed))
+			df, err := NewTSMReader(file, f.readerOptions...)
 			f.logger.Info("Opened file",
 				zap.String("path", file.Name()),
 				zap.Int("id", idx),
 				zap.Duration("duration", time.Since(start)))
 
-			// If we are unable to read a TSM file then log the error, rename
-			// the file, and continue loading the shard without it.
+			// If we are unable to read a TSM file then log the error.
 			if err != nil {
-				f.logger.Error("Cannot read corrupt tsm file, renaming", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(err))
 				file.Close()
-				if e := os.Rename(file.Name(), file.Name()+"."+BadTSMFileExtension); e != nil {
-					f.logger.Error("Cannot rename corrupt tsm file", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(e))
-					readerC <- &res{r: df, err: fmt.Errorf("cannot rename corrupt file %s: %v", file.Name(), e)}
+				if errors.Is(err, MmapError{}) {
+					// An MmapError may indicate we have insufficient
+					// handles for the mmap call, in which case the file should
+					// be left untouched, and the vm.max_map_count be raised.
+					f.logger.Error("Cannot read TSM file, system limit for vm.max_map_count may be too low",
+						zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(err))
+					readerC <- &res{r: df, err: fmt.Errorf("cannot read file %s, system limit for vm.max_map_count may be too low: %v", file.Name(), err)}
+					return
+				} else {
+					// If the file is corrupt, rename it and
+					// continue loading the shard without it.
+					f.logger.Error("Cannot read corrupt tsm file, renaming", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(err))
+					if e := os.Rename(file.Name(), file.Name()+"."+BadTSMFileExtension); e != nil {
+						f.logger.Error("Cannot rename corrupt tsm file", zap.String("path", file.Name()), zap.Int("id", idx), zap.Error(e))
+						readerC <- &res{r: df, err: fmt.Errorf("cannot rename corrupt file %s: %v", file.Name(), e)}
+						return
+					}
+					readerC <- &res{r: df, err: fmt.Errorf("cannot read corrupt file %s: %v", file.Name(), err)}
 					return
 				}
-				readerC <- &res{r: df, err: fmt.Errorf("cannot read corrupt file %s: %v", file.Name(), err)}
-				return
 			}
-
 			df.WithObserver(f.obs)
 			readerC <- &res{r: df}
 		}(i, file)
@@ -619,14 +645,12 @@ func (f *FileStore) Close() error {
 	// Let other methods access this closed object while we do the actual closing.
 	f.mu.Unlock()
 
-	for _, file := range files {
-		err := file.Close()
-		if err != nil {
-			return err
-		}
+	var errSlice []error
+	for _, tsmFile := range files {
+		errSlice = append(errSlice, tsmFile.Close())
 	}
 
-	return nil
+	return errors.Join(errSlice...)
 }
 
 func (f *FileStore) DiskSizeBytes() int64 {
@@ -779,7 +803,7 @@ func (f *FileStore) replace(oldFiles, newFiles []string, updatedFn func(r []TSMF
 			}
 		}
 
-		tsm, err := NewTSMReader(fd, WithMadviseWillNeed(f.tsmMMAPWillNeed))
+		tsm, err := NewTSMReader(fd, f.readerOptions...)
 		if err != nil {
 			if newName != oldName {
 				if err1 := os.Rename(newName, oldName); err1 != nil {
@@ -1062,17 +1086,94 @@ func (f *FileStore) locations(key []byte, t int64, ascending bool) []*location {
 func (f *FileStore) MakeSnapshotLinks(destPath string, files []TSMFile) (returnErr error) {
 	for _, tsmf := range files {
 		newpath := filepath.Join(destPath, filepath.Base(tsmf.Path()))
-		if err := copyOrLink(tsmf.Path(), newpath); err != nil {
+		err := f.copyOrLink(tsmf.Path(), newpath)
+		if err != nil {
 			return err
 		}
 		if tf := tsmf.TombstoneStats(); tf.TombstoneExists {
 			newpath := filepath.Join(destPath, filepath.Base(tf.Path))
-			if err := copyOrLink(tf.Path, newpath); err != nil {
+			err := f.copyOrLink(tf.Path, newpath)
+			if err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func (f *FileStore) copyOrLink(oldpath string, newpath string) error {
+	if f.copyFiles {
+		f.logger.Info("copying backup snapshots", zap.String("OldPath", oldpath), zap.String("NewPath", newpath))
+		if err := f.copyNotLink(oldpath, newpath); err != nil {
+			return err
+		}
+	} else {
+		f.logger.Info("linking backup snapshots", zap.String("OldPath", oldpath), zap.String("NewPath", newpath))
+		if err := f.linkNotCopy(oldpath, newpath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// copyNotLink - use file copies instead of hard links for 2 scenarios:
+// Windows does not permit deleting a file with open file handles
+// Azure does not support hard links in its default file system
+func (f *FileStore) copyNotLink(oldPath, newPath string) (returnErr error) {
+	rfd, err := os.Open(oldPath)
+	if err != nil {
+		return fmt.Errorf("error opening file for backup %s: %q", oldPath, err)
+	} else {
+		defer func() {
+			if e := rfd.Close(); returnErr == nil && e != nil {
+				returnErr = fmt.Errorf("error closing source file for backup %s: %w", oldPath, e)
+			}
+		}()
+	}
+	fi, err := rfd.Stat()
+	if err != nil {
+		return fmt.Errorf("error collecting statistics from file for backup %s: %w", oldPath, err)
+	}
+	wfd, err := os.OpenFile(newPath, os.O_RDWR|os.O_CREATE, fi.Mode())
+	if err != nil {
+		return fmt.Errorf("error creating temporary file for backup %s:  %w", newPath, err)
+	} else {
+		defer func() {
+			if e := wfd.Close(); returnErr == nil && e != nil {
+				returnErr = fmt.Errorf("error closing temporary file for backup %s: %w", newPath, e)
+			}
+		}()
+	}
+	if _, err := io.Copy(wfd, rfd); err != nil {
+		return fmt.Errorf("unable to copy file for backup from %s to %s: %w", oldPath, newPath, err)
+	}
+	if err := os.Chtimes(newPath, fi.ModTime(), fi.ModTime()); err != nil {
+		return fmt.Errorf("unable to set modification time on temporary backup file %s: %w", newPath, err)
+	}
+	return nil
+}
+
+// linkNotCopy - use hard links for backup snapshots
+func (f *FileStore) linkNotCopy(oldPath, newPath string) error {
+	if err := os.Link(oldPath, newPath); err != nil {
+		if errors.Is(err, syscall.ENOTSUP) {
+			if fi, e := os.Stat(oldPath); e == nil && !fi.IsDir() {
+				f.logger.Info("file system does not support hard links, switching to copies for backup", zap.String("OldPath", oldPath), zap.String("NewPath", newPath))
+				// Force future snapshots to copy
+				f.copyFiles = true
+				return f.copyNotLink(oldPath, newPath)
+			} else if e != nil {
+				// Stat failed
+				return fmt.Errorf("error creating hard link for backup, cannot determine if %s is a file or directory: %w", oldPath, e)
+			} else {
+				return fmt.Errorf("error creating hard link for backup - %s is a directory, not a file: %q", oldPath, err)
+			}
+		} else {
+			return fmt.Errorf("error creating hard link for backup from %s to %s: %w", oldPath, newPath, err)
+		}
+	} else {
+		return nil
+	}
 }
 
 // CreateSnapshot creates hardlinks for all tsm and tombstone files

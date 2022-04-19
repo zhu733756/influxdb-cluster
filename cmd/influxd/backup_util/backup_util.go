@@ -6,14 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gogo/protobuf/proto"
 	internal "github.com/influxdata/influxdb/cmd/influxd/backup_util/internal"
+	errors2 "github.com/influxdata/influxdb/pkg/errors"
 	"github.com/influxdata/influxdb/services/snapshotter"
 )
 
@@ -54,11 +55,12 @@ func (ep *PortablePacker) UnmarshalBinary(data []byte) error {
 	return nil
 }
 
-func GetMetaBytes(fname string) ([]byte, error) {
+func GetMetaBytes(fname string) (_ []byte, retErr error) {
 	f, err := os.Open(fname)
 	if err != nil {
 		return []byte{}, err
 	}
+	defer errors2.Capture(&retErr, f.Close)()
 
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, f); err != nil {
@@ -141,7 +143,7 @@ func (manifest *Manifest) Save(filename string) error {
 		return fmt.Errorf("create manifest: %v", err)
 	}
 
-	return ioutil.WriteFile(filename, b, 0600)
+	return os.WriteFile(filename, b, 0600)
 }
 
 // LoadIncremental loads multiple manifest files from a given directory.
@@ -209,8 +211,12 @@ type CountingWriter struct {
 
 func (w *CountingWriter) Write(p []byte) (n int, err error) {
 	n, err = w.Writer.Write(p)
-	w.Total += int64(n)
+	atomic.AddInt64(&w.Total, int64(n))
 	return
+}
+
+func (w *CountingWriter) BytesWritten() int64 {
+	return atomic.LoadInt64(&w.Total)
 }
 
 // retentionAndShardFromPath will take the shard relative path and split it into the

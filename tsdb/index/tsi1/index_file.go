@@ -83,6 +83,7 @@ func NewIndexFile(sfile *tsdb.SeriesFile) *IndexFile {
 func (f *IndexFile) bytes() int {
 	var b int
 	f.wg.Add(1)
+	defer f.wg.Done()
 	b += 16 // wg WaitGroup is 16 bytes
 	b += int(unsafe.Sizeof(f.data))
 	// Do not count f.data contents because it is mmap'd
@@ -101,7 +102,6 @@ func (f *IndexFile) bytes() int {
 	b += 24 // mu RWMutex is 24 bytes
 	b += int(unsafe.Sizeof(f.compacting))
 	b += int(unsafe.Sizeof(f.path)) + len(f.path)
-	f.wg.Done()
 	return b
 }
 
@@ -160,8 +160,8 @@ func (f *IndexFile) Size() int64 { return int64(len(f.data)) }
 // Compacting returns true if the file is being compacted.
 func (f *IndexFile) Compacting() bool {
 	f.mu.RLock()
+	defer f.mu.RUnlock()
 	v := f.compacting
-	f.mu.RUnlock()
 	return v
 }
 
@@ -170,15 +170,15 @@ func (f *IndexFile) Compacting() bool {
 func (f *IndexFile) UnmarshalBinary(data []byte) error {
 	// Ensure magic number exists at the beginning.
 	if len(data) < len(FileSignature) {
-		return io.ErrShortBuffer
+		return fmt.Errorf("%q: %w", f.path, io.ErrShortBuffer)
 	} else if !bytes.Equal(data[:len(FileSignature)], []byte(FileSignature)) {
-		return ErrInvalidIndexFile
+		return fmt.Errorf("%q: %w", f.path, ErrInvalidIndexFile)
 	}
 
 	// Read index file trailer.
 	t, err := ReadIndexFileTrailer(data)
 	if err != nil {
-		return err
+		return fmt.Errorf("%q: %w", f.path, err)
 	}
 
 	// Slice series sketch data.
@@ -191,7 +191,7 @@ func (f *IndexFile) UnmarshalBinary(data []byte) error {
 
 	// Unmarshal measurement block.
 	if err := f.mblk.UnmarshalBinary(data[t.MeasurementBlock.Offset:][:t.MeasurementBlock.Size]); err != nil {
-		return err
+		return fmt.Errorf("%q: %w", f.path, err)
 	}
 
 	// Unmarshal each tag block.
@@ -208,7 +208,7 @@ func (f *IndexFile) UnmarshalBinary(data []byte) error {
 		// Unmarshal measurement block.
 		var tblk TagBlock
 		if err := tblk.UnmarshalBinary(buf); err != nil {
-			return err
+			return fmt.Errorf("%q: %w", f.path, err)
 		}
 		f.tblks[string(e.name)] = &tblk
 	}

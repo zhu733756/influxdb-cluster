@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"os"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/influxdata/influxdb/cmd/influxd/backup_util"
+	errors2 "github.com/influxdata/influxdb/pkg/errors"
 	"github.com/influxdata/influxdb/services/snapshotter"
 	"github.com/influxdata/influxdb/tcp"
 	gzip "github.com/klauspost/pgzip"
@@ -88,7 +88,8 @@ func (cmd *Command) Run(args ...string) error {
 		if err := cmd.backupMetastore(); err != nil {
 			return err
 		}
-		err = cmd.backupShard(cmd.database, cmd.retentionPolicy, cmd.shardID)
+		// Pass true for verifyLocation so we verify that db and rp are correct if given
+		err = cmd.backupShard(cmd.database, cmd.retentionPolicy, cmd.shardID, true)
 
 	} else if cmd.retentionPolicy != "" {
 		// always backup the metastore
@@ -209,7 +210,7 @@ func (cmd *Command) parseFlags(args []string) (err error) {
 
 	// Ensure that only one arg is specified.
 	if fs.NArg() != 1 {
-		return errors.New("Exactly one backup path is required.")
+		return errors.New("exactly one backup path is required")
 	}
 	cmd.path = fs.Arg(0)
 
@@ -218,18 +219,65 @@ func (cmd *Command) parseFlags(args []string) (err error) {
 	return err
 }
 
-func (cmd *Command) backupShard(db, rp, sid string) error {
+// backupShard will backup a single shard. sid is the shard ID as a decimal string and
+// must be given. db and rp are the database and retention policy the shard belongs to,
+// respectively. For both db and rp, if they are not given the snapshot service will
+// be queried to find their correct value. Also for both db and rp, if they are given
+// and verifyLocation is true, then the snapshotter service will be queried and the value
+// will be checked against the databases value. If there is a mismatch, an error is returned.
+func (cmd *Command) backupShard(db, rp, sid string, verifyLocation bool) (err error) {
 	reqType := snapshotter.RequestShardBackup
 	if !cmd.isBackup {
 		reqType = snapshotter.RequestShardExport
 	}
 
-	id, err := strconv.ParseUint(sid, 10, 64)
+	shardId, err := strconv.ParseUint(sid, 10, 64)
 	if err != nil {
 		return err
 	}
 
-	shardArchivePath, err := cmd.nextPath(filepath.Join(cmd.path, fmt.Sprintf(backup_util.BackupFilePattern, db, rp, id)))
+	// Get info about shard retention policy and database to fill-in missing db / rp
+	if db == "" || rp == "" || verifyLocation {
+		infoReq := &snapshotter.Request{
+			Type:           snapshotter.RequestDatabaseInfo,
+			BackupDatabase: db, // use db if we did happen to get it to limit result set
+		}
+
+		infoResponse, err := cmd.requestInfo(infoReq)
+		if err != nil {
+			return err
+		}
+
+		var shardFound bool
+		for _, path := range infoResponse.Paths {
+			checkDb, checkRp, checkSid, err := backup_util.DBRetentionAndShardFromPath(path)
+			if err != nil {
+				return fmt.Errorf("error while finding shard's db/rp: %w", err)
+			}
+			if sid == checkSid {
+				// Found the shard, now fill-in / check db and rp
+				if db == "" {
+					db = checkDb
+				} else if verifyLocation && db != checkDb {
+					return fmt.Errorf("expected shard %d in database '%s', but found '%s'", shardId, db, checkDb)
+				}
+
+				if rp == "" {
+					rp = checkRp
+				} else if verifyLocation && rp != checkRp {
+					return fmt.Errorf("expected shard %d with retention policy '%s', but found '%s'", shardId, rp, checkRp)
+				}
+
+				shardFound = true
+				break
+			}
+		}
+		if !shardFound {
+			return fmt.Errorf("did not find shard %d", shardId)
+		}
+	}
+
+	shardArchivePath, err := cmd.nextPath(filepath.Join(cmd.path, fmt.Sprintf(backup_util.BackupFilePattern, db, rp, shardId)))
 	if err != nil {
 		return err
 	}
@@ -245,7 +293,7 @@ func (cmd *Command) backupShard(db, rp, sid string) error {
 		Type:                  reqType,
 		BackupDatabase:        db,
 		BackupRetentionPolicy: rp,
-		ShardID:               id,
+		ShardID:               shardId,
 		Since:                 cmd.since,
 		ExportStart:           cmd.start,
 		ExportEnd:             cmd.end,
@@ -254,7 +302,7 @@ func (cmd *Command) backupShard(db, rp, sid string) error {
 	// TODO: verify shard backup data
 	err = cmd.downloadAndVerify(req, shardArchivePath, nil)
 	if err != nil {
-		os.Remove(shardArchivePath)
+		_ = os.Remove(shardArchivePath)
 		return err
 	}
 	if !cmd.portable {
@@ -262,64 +310,58 @@ func (cmd *Command) backupShard(db, rp, sid string) error {
 	}
 
 	if cmd.portable {
-		f, err := os.Open(shardArchivePath)
+		var f, out *os.File
+		f, err = os.Open(shardArchivePath)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
-		defer os.Remove(shardArchivePath)
+		defer func() {
+			if closeErr := f.Close(); err == nil {
+				err = closeErr
+			}
+			if remErr := os.Remove(shardArchivePath); err == nil {
+				err = remErr
+			}
+		}()
 
 		filePrefix := cmd.portableFileBase + ".s" + sid
 		filename := filePrefix + ".tar.gz"
-		out, err := os.OpenFile(filepath.Join(cmd.path, filename), os.O_CREATE|os.O_RDWR, 0600)
+		out, err = os.OpenFile(filepath.Join(cmd.path, filename), os.O_CREATE|os.O_RDWR, 0600)
 		if err != nil {
 			return err
 		}
-
+		defer func() {
+			if out != nil {
+				if e := out.Close(); err == nil {
+					err = e
+				}
+			}
+		}()
 		zw := gzip.NewWriter(out)
+		defer func() {
+			if zw != nil {
+				if e := zw.Close(); err == nil {
+					err = e
+				}
+			}
+		}()
 		zw.Name = filePrefix + ".tar"
 
 		cw := backup_util.CountingWriter{Writer: zw}
 
 		_, err = io.Copy(&cw, f)
 		if err != nil {
-			if err := zw.Close(); err != nil {
-				return err
-			}
-
-			if err := out.Close(); err != nil {
-				return err
-			}
 			return err
 		}
 
-		shardid, err := strconv.ParseUint(sid, 10, 64)
-		if err != nil {
-			if err := zw.Close(); err != nil {
-				return err
-			}
-
-			if err := out.Close(); err != nil {
-				return err
-			}
-			return err
-		}
 		cmd.manifest.Files = append(cmd.manifest.Files, backup_util.Entry{
 			Database:     db,
 			Policy:       rp,
-			ShardID:      shardid,
+			ShardID:      shardId,
 			FileName:     filename,
 			Size:         cw.Total,
 			LastModified: 0,
 		})
-
-		if err := zw.Close(); err != nil {
-			return err
-		}
-
-		if err := out.Close(); err != nil {
-			return err
-		}
 
 		cmd.BackupFiles = append(cmd.BackupFiles, filename)
 	}
@@ -379,7 +421,8 @@ func (cmd *Command) backupResponsePaths(response *snapshotter.Response) error {
 			return err
 		}
 
-		err = cmd.backupShard(db, rp, id)
+		// Don't need to verify db and rp, we know they're correct here
+		err = cmd.backupShard(db, rp, id, false)
 
 		if err != nil && !cmd.continueOnError {
 			cmd.StderrLogger.Printf("error (%s) when backing up db: %s, rp %s, shard %s. continuing backup on remaining shards", err, db, rp, id)
@@ -392,7 +435,7 @@ func (cmd *Command) backupResponsePaths(response *snapshotter.Response) error {
 
 // backupMetastore will backup the whole metastore on the host to the backup path
 // if useDB is non-empty, it will backup metadata only for the named database.
-func (cmd *Command) backupMetastore() error {
+func (cmd *Command) backupMetastore() (retErr error) {
 	metastoreArchivePath, err := cmd.nextPath(filepath.Join(cmd.path, backup_util.Metafile))
 	if err != nil {
 		return err
@@ -404,12 +447,12 @@ func (cmd *Command) backupMetastore() error {
 		Type: snapshotter.RequestMetastoreBackup,
 	}
 
-	err = cmd.downloadAndVerify(req, metastoreArchivePath, func(file string) error {
+	err = cmd.downloadAndVerify(req, metastoreArchivePath, func(file string) (rErr error) {
 		f, err := os.Open(file)
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer errors2.Capture(&rErr, f.Close)()
 
 		var magicByte [8]byte
 		n, err := io.ReadFull(f, magicByte[:])
@@ -418,7 +461,7 @@ func (cmd *Command) backupMetastore() error {
 		}
 
 		if n < 8 {
-			return errors.New("Not enough bytes data to verify")
+			return errors.New("not enough bytes data to verify")
 		}
 
 		magic := binary.BigEndian.Uint64(magicByte[:])
@@ -440,7 +483,7 @@ func (cmd *Command) backupMetastore() error {
 
 	if cmd.portable {
 		metaBytes, err := backup_util.GetMetaBytes(metastoreArchivePath)
-		defer os.Remove(metastoreArchivePath)
+		defer errors2.Capture(&retErr, func() error { return os.Remove(metastoreArchivePath) })()
 		if err != nil {
 			return err
 		}
@@ -450,7 +493,7 @@ func (cmd *Command) backupMetastore() error {
 		if err != nil {
 			return err
 		}
-		if err := ioutil.WriteFile(filepath.Join(cmd.path, filename), protoBytes, 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(cmd.path, filename), protoBytes, 0644); err != nil {
 			fmt.Fprintln(cmd.Stdout, "Error.")
 			return err
 		}
@@ -512,13 +555,13 @@ func (cmd *Command) downloadAndVerify(req *snapshotter.Request, path string, val
 }
 
 // download downloads a snapshot of either the metastore or a shard from a host to a given path.
-func (cmd *Command) download(req *snapshotter.Request, path string) error {
+func (cmd *Command) download(req *snapshotter.Request, path string) (retErr error) {
 	// Create local file to write to.
 	f, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("open temp file: %s", err)
 	}
-	defer f.Close()
+	defer errors2.Capture(&retErr, f.Close)()
 
 	min := 2 * time.Second
 	for i := 0; i < 10; i++ {
@@ -528,7 +571,7 @@ func (cmd *Command) download(req *snapshotter.Request, path string) error {
 			if err != nil {
 				return err
 			}
-			defer conn.Close()
+			defer errors2.Capture(&retErr, conn.Close)()
 
 			_, err = conn.Write([]byte{byte(req.Type)})
 			if err != nil {

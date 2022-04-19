@@ -9,7 +9,6 @@ import (
 	"expvar"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
@@ -290,9 +289,7 @@ func NewHandler(c Config) *Handler {
 	}
 
 	if !c.FluxEnabled {
-		fluxRoute.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "Flux query service disabled. Verify flux-enabled=true in the [http] section of the InfluxDB config.", http.StatusForbidden)
-		}
+		fluxRoute.HandlerFunc = h.serveFluxQueryDisabled
 	} else {
 		fluxRoute.HandlerFunc = h.serveFluxQuery
 	}
@@ -811,11 +808,10 @@ func (h *Handler) async(q *influxql.Query, results <-chan *query.Result) {
 // bucket2drbp extracts a bucket and retention policy from a properly formatted
 // string.
 //
-// The 2.x compatible endpoints encode the databse and retention policy names
+// The 2.x compatible endpoints encode the database and retention policy names
 // in the database URL query value.  It is encoded using a forward slash like
 // "database/retentionpolicy" and we should be able to simply split that string
 // on the forward slash.
-//
 func bucket2dbrp(bucket string) (string, string, error) {
 	// test for a slash in our bucket name.
 	switch idx := strings.IndexByte(bucket, '/'); idx {
@@ -855,6 +851,7 @@ func (h *Handler) serveWriteV2(w http.ResponseWriter, r *http.Request, user meta
 	default:
 		err := fmt.Sprintf("invalid precision %q (use ns, us, ms or s)", precision)
 		h.httpError(w, err, http.StatusBadRequest)
+		return
 	}
 
 	db, rp, err := bucket2dbrp(r.URL.Query().Get("bucket"))
@@ -874,6 +871,7 @@ func (h *Handler) serveWriteV1(w http.ResponseWriter, r *http.Request, user meta
 	default:
 		err := fmt.Sprintf("invalid precision %q (use n, u, ms, s, m or h)", precision)
 		h.httpError(w, err, http.StatusBadRequest)
+		return
 	}
 
 	db := r.URL.Query().Get("db")
@@ -1246,7 +1244,9 @@ func (h *Handler) servePromWrite(w http.ResponseWriter, r *http.Request, user me
 // servePromRead will convert a Prometheus remote read request into a storage
 // query and returns data in Prometheus remote read protobuf format.
 func (h *Handler) servePromRead(w http.ResponseWriter, r *http.Request, user meta.User) {
-	compressed, err := ioutil.ReadAll(r.Body)
+	atomic.AddInt64(&h.stats.PromReadRequests, 1)
+	h.requestTracker.Add(r, user)
+	compressed, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.httpError(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1267,6 +1267,17 @@ func (h *Handler) servePromRead(w http.ResponseWriter, r *http.Request, user met
 	// Query the DB and create a ReadResponse for Prometheus
 	db := r.FormValue("db")
 	rp := r.FormValue("rp")
+
+	if h.Config.AuthEnabled && h.Config.PromReadAuthEnabled {
+		if user == nil {
+			h.httpError(w, fmt.Sprintf("user is required to read from database %q", db), http.StatusForbidden)
+			return
+		}
+		if h.QueryAuthorizer.AuthorizeDatabase(user, influxql.ReadPrivilege, db) != nil {
+			h.httpError(w, fmt.Sprintf("user %q is not authorized to read from database %q", user.ID(), db), http.StatusForbidden)
+			return
+		}
+	}
 
 	readRequest, err := prometheus.ReadRequestToInfluxStorageRequest(&req, db, rp)
 	if err != nil {
@@ -1453,6 +1464,11 @@ func (h *Handler) serveFluxQuery(w http.ResponseWriter, r *http.Request, user me
 	}
 }
 
+func (h *Handler) serveFluxQueryDisabled(w http.ResponseWriter, r *http.Request, user meta.User) {
+	h.Logger.Warn("Received flux query but flux-enabled=false in [http] section of InfluxDB config")
+	h.httpError(w, "Flux query service disabled. Verify flux-enabled=true in the [http] section of the InfluxDB config.", http.StatusForbidden)
+}
+
 func (h *Handler) logFluxQuery(n int64, stats flux.Statistics, compiler flux.Compiler, err error) {
 	var q string
 	switch c := compiler.(type) {
@@ -1514,6 +1530,25 @@ func (h *Handler) serveExpvar(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "{")
 	}
 
+	if val := diags["build"]; val != nil {
+		jv, err := parseBuildInfo(val)
+		if err != nil {
+			h.httpError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		data, err := json.Marshal(jv)
+		if err != nil {
+			h.httpError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if !first {
+			fmt.Fprintln(w, ",")
+		}
+		first = false
+		fmt.Fprintf(w, "\"build\": %s", data)
+	}
+
 	if val := expvar.Get("cmdline"); val != nil {
 		if !first {
 			fmt.Fprintln(w, ",")
@@ -1528,6 +1563,8 @@ func (h *Handler) serveExpvar(w http.ResponseWriter, r *http.Request) {
 		first = false
 		fmt.Fprintf(w, "\"memstats\": %s", val)
 	}
+
+	uniqueKeys := make(map[string]int)
 
 	for _, s := range stats {
 		val, err := json.Marshal(s)
@@ -1560,6 +1597,12 @@ func (h *Handler) serveExpvar(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		key := buf.String()
+		v := uniqueKeys[key]
+		uniqueKeys[key] = v + 1
+		if v > 0 {
+			fmt.Fprintf(buf, ":%d", v)
+			key = buf.String()
+		}
 
 		if !first {
 			fmt.Fprintln(w, ",")
@@ -1671,6 +1714,32 @@ func parseSystemDiagnostics(d *diagnostics.Diagnostics) (map[string]interface{},
 	return m, nil
 }
 
+// parseBuildInfo converts the build info diagnostics into an appropriate
+// format for marshaling to JSON in the /debug/vars format.
+func parseBuildInfo(d *diagnostics.Diagnostics) (map[string]interface{}, error) {
+	m := map[string]interface{}{"Version": nil, "Commit": nil, "Branch": nil, "Build Time": nil}
+	for key := range m {
+		// Find the associated column.
+		ci := -1
+		for i, col := range d.Columns {
+			if col == key {
+				ci = i
+				break
+			}
+		}
+
+		if ci == -1 {
+			return nil, fmt.Errorf("unable to find column %q", key)
+		}
+
+		if len(d.Rows) < 1 || len(d.Rows[0]) <= ci {
+			return nil, fmt.Errorf("no data for column %q", key)
+		}
+		m[key] = d.Rows[0][ci]
+	}
+	return m, nil
+}
+
 // httpError writes an error to the client in a standard format.
 func (h *Handler) httpError(w http.ResponseWriter, errmsg string, code int) {
 	if code == http.StatusUnauthorized {
@@ -1707,11 +1776,10 @@ type credentials struct {
 }
 
 func parseToken(token string) (user, pass string, ok bool) {
-	s := strings.IndexByte(token, ':')
-	if s < 0 {
-		return
+	if t1, t2, ok := strings.Cut(token, ":"); ok {
+		return t1, t2, ok
 	}
-	return token[:s], token[s+1:], true
+	return
 }
 
 // parseCredentials parses a request and returns the authentication credentials.
@@ -1881,6 +1949,7 @@ func cors(inner http.Handler) http.Handler {
 				`OPTIONS`,
 				`POST`,
 				`PUT`,
+				`PATCH`,
 			}, ", "))
 
 			w.Header().Set(`Access-Control-Allow-Headers`, strings.Join([]string{

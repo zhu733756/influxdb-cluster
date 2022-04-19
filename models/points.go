@@ -96,6 +96,9 @@ type Point interface {
 	// HasTag returns true if the tag exists for the point.
 	HasTag(tag []byte) bool
 
+	// ForEachField iterates over each field invoking fn. if fn returns false, iteration stops.
+	ForEachField(fn func(k, v []byte) bool) error
+
 	// Fields returns the fields for the point.
 	Fields() (Fields, error)
 
@@ -1570,6 +1573,10 @@ func walkTags(buf []byte, fn func(key, value []byte) bool) {
 	}
 }
 
+func (p *point) ForEachField(fn func(k, v []byte) bool) error {
+	return walkFields(p.fields, fn)
+}
+
 // walkFields walks each field key and value via fn.  If fn returns false, the iteration
 // is stopped.  The values are the raw byte slices and not the converted types.
 func walkFields(buf []byte, fn func(key, value []byte) bool) error {
@@ -1636,7 +1643,7 @@ func AppendMakeKey(dst []byte, name []byte, tags Tags) []byte {
 	// unescape the name and then re-escape it to avoid double escaping.
 	// The key should always be stored in escaped form.
 	dst = append(dst, EscapeMeasurement(unescapeMeasurement(name))...)
-	dst = tags.AppendHashKey(dst)
+	dst = tags.AppendHashKey(dst, true)
 	return dst
 }
 
@@ -2138,8 +2145,8 @@ func (a Tags) Merge(other map[string]string) Tags {
 }
 
 // HashKey hashes all of a tag's keys.
-func (a Tags) HashKey() []byte {
-	return a.AppendHashKey(nil)
+func (a Tags) HashKey(escapeTags bool) []byte {
+	return a.AppendHashKey(nil, escapeTags)
 }
 
 func (a Tags) needsEscape() bool {
@@ -2156,7 +2163,7 @@ func (a Tags) needsEscape() bool {
 }
 
 // AppendHashKey appends the result of hashing all of a tag's keys and values to dst and returns the extended buffer.
-func (a Tags) AppendHashKey(dst []byte) []byte {
+func (a Tags) AppendHashKey(dst []byte, escapeTags bool) []byte {
 	// Empty maps marshal to empty bytes.
 	if len(a) == 0 {
 		return dst
@@ -2166,7 +2173,7 @@ func (a Tags) AppendHashKey(dst []byte) []byte {
 
 	sz := 0
 	var escaped Tags
-	if a.needsEscape() {
+	if escapeTags && a.needsEscape() {
 		var tmp [20]Tag
 		if len(a) < len(tmp) {
 			escaped = tmp[:len(a)]
@@ -2482,4 +2489,44 @@ func ValidKeyTokens(name string, tags Tags) bool {
 		}
 	}
 	return true
+}
+
+// ValidPointStrings validates the measurement name, tage names and values, and field names in a point
+func ValidPointStrings(p Point) (err error) {
+	if !ValidKeyToken(string(p.Name())) {
+		return fmt.Errorf("invalid or unprintable UTF-8 characters in measurement name: %q", p.Name())
+	}
+
+	validTag := func(k []byte, v []byte) bool {
+		if !ValidKeyToken(string(k)) {
+			err = fmt.Errorf("invalid or unprintable UTF-8 characters in tag key: %q", k)
+			return false
+		} else if !ValidKeyToken(string(v)) {
+			err = fmt.Errorf("invalid or unprintable UTF-8 characters in tag value: %q", v)
+			return false
+		}
+		return true
+	}
+
+	p.ForEachTag(validTag)
+	if err != nil {
+		return err
+	}
+
+	validField := func(k, v []byte) bool {
+		if !ValidKeyToken(string(k)) {
+			err = fmt.Errorf("invalid or unprintable UTF-8 in field name: %q", k)
+			return false
+		} else {
+			return true
+		}
+	}
+
+	if e := p.ForEachField(validField); e != nil {
+		return e
+	} else if err != nil {
+		return err
+	} else {
+		return nil
+	}
 }

@@ -30,6 +30,10 @@ const (
 	KilledTask
 )
 
+var (
+	queryFieldNames []string = []string{"qid", "query", "database", "duration", "status"}
+)
+
 func (t TaskStatus) String() string {
 	switch t {
 	case RunningTask:
@@ -67,6 +71,9 @@ type TaskManager struct {
 	// Log queries if they are slower than this time.
 	// If zero, slow queries will never be logged.
 	LogQueriesAfter time.Duration
+
+	// If true, queries that are killed due to `query-timeout` will be logged.
+	LogTimedoutQueries bool
 
 	// Maximum number of concurrent queries.
 	MaxConcurrentQueries int
@@ -136,22 +143,37 @@ func (t *TaskManager) executeShowQueriesStatement(q *influxql.ShowQueriesStateme
 	for id, qi := range t.queries {
 		d := now.Sub(qi.startTime)
 
-		switch {
-		case d >= time.Second:
-			d = d - (d % time.Second)
-		case d >= time.Millisecond:
-			d = d - (d % time.Millisecond)
-		case d >= time.Microsecond:
-			d = d - (d % time.Microsecond)
-		}
+		d = prettyTime(d)
 
 		values = append(values, []interface{}{id, qi.query, qi.database, d.String(), qi.status.String()})
 	}
 
 	return []*models.Row{{
-		Columns: []string{"qid", "query", "database", "duration", "status"},
+		Columns: queryFieldNames,
 		Values:  values,
 	}}, nil
+}
+
+func prettyTime(d time.Duration) time.Duration {
+	switch {
+	case d >= time.Second:
+		d = d - (d % time.Second)
+	case d >= time.Millisecond:
+		d = d - (d % time.Millisecond)
+	case d >= time.Microsecond:
+		d = d - (d % time.Microsecond)
+	}
+	return d
+}
+
+func (t *TaskManager) LogCurrentQueries(logFunc func(string, ...zap.Field)) {
+	for _, queryInfo := range t.Queries() {
+		logFunc("Current Queries", zap.Uint64(queryFieldNames[0], queryInfo.ID),
+			zap.String(queryFieldNames[1], queryInfo.Query),
+			zap.String(queryFieldNames[2], queryInfo.Database),
+			zap.String(queryFieldNames[3], prettyTime(queryInfo.Duration).String()),
+			zap.String(queryFieldNames[4], queryInfo.Status.String()))
+	}
 }
 
 func (t *TaskManager) queryError(qid uint64, err error) {
@@ -296,6 +318,14 @@ func (t *TaskManager) waitForQuery(qid uint64, interrupt <-chan struct{}, closin
 
 		t.queryError(qid, err)
 	case <-timerCh:
+		if t.LogTimedoutQueries {
+			t.Logger.Warn(
+				"query killed for exceeding timeout limit",
+				zap.String("query", t.queries[qid].query),
+				zap.String("database", t.queries[qid].database),
+				zap.String("timeout", prettyTime(t.QueryTimeout).String()),
+			)
+		}
 		t.queryError(qid, ErrQueryTimeoutLimitExceeded)
 	case <-interrupt:
 		// Query was manually closed so exit the select.

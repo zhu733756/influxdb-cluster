@@ -14,12 +14,15 @@ import (
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/monitor"
+	"github.com/influxdata/influxdb/pkg/bytesutil"
+	"github.com/influxdata/influxdb/pkg/estimator"
 	"github.com/influxdata/influxdb/pkg/tracing"
 	"github.com/influxdata/influxdb/pkg/tracing/fields"
 	"github.com/influxdata/influxdb/query"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/tsdb"
 	"github.com/influxdata/influxql"
+	"golang.org/x/sync/errgroup"
 )
 
 // ErrDatabaseNameRequired is returned when executing statements that require a database,
@@ -170,7 +173,7 @@ func (e *StatementExecutor) ExecuteStatement(ctx *query.ExecutionContext, stmt i
 		}
 		err = e.executeRevokeAdminStatement(stmt)
 	case *influxql.ShowContinuousQueriesStatement:
-		rows, err = e.executeShowContinuousQueriesStatement(stmt)
+		rows, err = e.executeShowContinuousQueriesStatement(ctx, stmt)
 	case *influxql.ShowDatabasesStatement:
 		rows, err = e.executeShowDatabasesStatement(ctx, stmt)
 	case *influxql.ShowDiagnosticsStatement:
@@ -185,6 +188,8 @@ func (e *StatementExecutor) ExecuteStatement(ctx *query.ExecutionContext, stmt i
 		rows, err = e.executeShowRetentionPoliciesStatement(stmt)
 	case *influxql.ShowSeriesCardinalityStatement:
 		rows, err = e.executeShowSeriesCardinalityStatement(ctx, stmt)
+	case *influxql.ShowServersStatement:
+		rows, err = e.executeShowServersStatement(stmt)
 	case *influxql.ShowShardsStatement:
 		rows, err = e.executeShowShardsStatement(stmt)
 	case *influxql.ShowShardGroupsStatement:
@@ -327,7 +332,7 @@ func (e *StatementExecutor) executeDeleteSeriesStatement(stmt *influxql.DeleteSe
 	// Convert "now()" to current time.
 	stmt.Condition = influxql.Reduce(stmt.Condition, &influxql.NowValuer{Now: time.Now().UTC()})
 
-	// Locally delete the series.
+	// Delete the series.
 	return e.TSDBStore.DeleteSeries(database, stmt.Sources, stmt.Condition)
 }
 
@@ -343,7 +348,7 @@ func (e *StatementExecutor) executeDropDatabaseStatement(stmt *influxql.DropData
 		return nil
 	}
 
-	// Locally delete the datababse.
+	// Delete the database.
 	if err := e.TSDBStore.DeleteDatabase(stmt.Name); err != nil {
 		return err
 	}
@@ -357,7 +362,7 @@ func (e *StatementExecutor) executeDropMeasurementStatement(stmt *influxql.DropM
 		return query.ErrDatabaseNotFound(database)
 	}
 
-	// Locally drop the measurement
+	// Drop the measurement.
 	return e.TSDBStore.DeleteMeasurement(database, stmt.Name)
 }
 
@@ -371,12 +376,12 @@ func (e *StatementExecutor) executeDropSeriesStatement(stmt *influxql.DropSeries
 		return errors.New("DROP SERIES doesn't support time in WHERE clause")
 	}
 
-	// Locally drop the series.
+	// Drop the series.
 	return e.TSDBStore.DeleteSeries(database, stmt.Sources, stmt.Condition)
 }
 
 func (e *StatementExecutor) executeDropShardStatement(stmt *influxql.DropShardStatement) error {
-	// Locally delete the shard.
+	// Delete the shard.
 	if err := e.TSDBStore.DeleteShard(stmt.ID); err != nil {
 		return err
 	}
@@ -395,7 +400,7 @@ func (e *StatementExecutor) executeDropRetentionPolicyStatement(stmt *influxql.D
 		return nil
 	}
 
-	// Locally drop the retention policy.
+	// Drop the retention policy.
 	if err := e.TSDBStore.DeleteRetentionPolicy(stmt.Database, stmt.Name); err != nil {
 		return err
 	}
@@ -645,16 +650,20 @@ func (e *StatementExecutor) createIterators(ctx context.Context, stmt *influxql.
 	return cur, nil
 }
 
-func (e *StatementExecutor) executeShowContinuousQueriesStatement(stmt *influxql.ShowContinuousQueriesStatement) (models.Rows, error) {
+func (e *StatementExecutor) executeShowContinuousQueriesStatement(ctx *query.ExecutionContext, stmt *influxql.ShowContinuousQueriesStatement) (models.Rows, error) {
 	dis := e.MetaClient.Databases()
+	a := ctx.ExecutionOptions.CoarseAuthorizer
 
 	rows := []*models.Row{}
 	for _, di := range dis {
-		row := &models.Row{Columns: []string{"name", "query"}, Name: di.Name}
-		for _, cqi := range di.ContinuousQueries {
-			row.Values = append(row.Values, []interface{}{cqi.Name, cqi.Query})
+		// Only include databases that the user is authorized to read or write.
+		if a.AuthorizeDatabase(influxql.ReadPrivilege, di.Name) || a.AuthorizeDatabase(influxql.WritePrivilege, di.Name) {
+			row := &models.Row{Columns: []string{"name", "query"}, Name: di.Name}
+			for _, cqi := range di.ContinuousQueries {
+				row.Values = append(row.Values, []interface{}{cqi.Name, cqi.Query})
+			}
+			rows = append(rows, row)
 		}
-		rows = append(rows, row)
 	}
 	return rows, nil
 }
@@ -714,45 +723,110 @@ func (e *StatementExecutor) executeShowGrantsForUserStatement(q *influxql.ShowGr
 	return []*models.Row{row}, nil
 }
 
+type measurementRow struct {
+	name   []byte
+	db, rp string
+}
+
 func (e *StatementExecutor) executeShowMeasurementsStatement(ctx *query.ExecutionContext, q *influxql.ShowMeasurementsStatement) error {
-	if q.Database == "" {
+	if q.Database == "" && !q.WildcardDatabase {
 		return ErrDatabaseNameRequired
 	}
 
-	names, err := e.TSDBStore.MeasurementNames(ctx.Context, ctx.Authorizer, q.Database, q.Condition)
-	if err != nil || len(names) == 0 {
-		return ctx.Send(&query.Result{
-			Err: err,
-		})
+	onlyPrintMeasurements := !(q.WildcardDatabase || q.WildcardRetentionPolicy || q.RetentionPolicy != "")
+
+	var sources []struct {
+		db, rp string
+	}
+	if q.WildcardDatabase {
+		if q.RetentionPolicy != "" {
+			return ctx.Send(&query.Result{
+				Err: fmt.Errorf("query 'SHOW MEASUREMENTS ON *.rp' not supported. use 'ON *.*' or specify a database"),
+			})
+		}
+		if !q.WildcardRetentionPolicy {
+			return ctx.Send(&query.Result{
+				Err: fmt.Errorf("query 'SHOW MEASUREMENTS ON *' not supported. use 'ON *.*' or specify a database"),
+			})
+		}
+		for _, dbInfo := range e.MetaClient.Databases() {
+			for _, rpInfo := range dbInfo.RetentionPolicies {
+				sources = append(sources, struct{ db, rp string }{dbInfo.Name, rpInfo.Name})
+			}
+		}
+	} else if q.WildcardRetentionPolicy {
+		dbInfo := e.MetaClient.Database(q.Database)
+		if dbInfo == nil {
+			return ctx.Send(&query.Result{
+				Err: fmt.Errorf("unknown database %s", dbInfo.Name),
+			})
+		}
+		for _, rpInfo := range dbInfo.RetentionPolicies {
+			sources = append(sources, struct{ db, rp string }{dbInfo.Name, rpInfo.Name})
+		}
+	} else {
+		sources = append(sources, struct{ db, rp string }{q.Database, q.RetentionPolicy})
+	}
+
+	var rows []measurementRow
+	for _, source := range sources {
+		names, err := e.TSDBStore.MeasurementNames(ctx.Context, ctx.Authorizer, source.db, source.rp, q.Condition)
+		if err != nil {
+			return ctx.Send(&query.Result{
+				Err: err,
+			})
+		}
+		for _, name := range names {
+			rows = append(rows, measurementRow{
+				name: name,
+				db:   source.db,
+				rp:   source.rp,
+			})
+		}
 	}
 
 	if q.Offset > 0 {
-		if q.Offset >= len(names) {
-			names = nil
+		if q.Offset >= len(rows) {
+			rows = nil
 		} else {
-			names = names[q.Offset:]
+			rows = rows[q.Offset:]
 		}
 	}
 
 	if q.Limit > 0 {
-		if q.Limit < len(names) {
-			names = names[:q.Limit]
+		if q.Limit < len(rows) {
+			rows = rows[:q.Limit]
 		}
 	}
 
-	values := make([][]interface{}, len(names))
-	for i, name := range names {
-		values[i] = []interface{}{string(name)}
+	if len(rows) == 0 {
+		return ctx.Send(&query.Result{})
 	}
 
-	if len(values) == 0 {
-		return ctx.Send(&query.Result{})
+	if onlyPrintMeasurements {
+		values := make([][]interface{}, len(rows))
+		for i, r := range rows {
+			values[i] = []interface{}{string(r.name)}
+		}
+
+		return ctx.Send(&query.Result{
+			Series: []*models.Row{{
+				Name:    "measurements",
+				Columns: []string{"name"},
+				Values:  values,
+			}},
+		})
+	}
+
+	values := make([][]interface{}, len(rows))
+	for i, r := range rows {
+		values[i] = []interface{}{string(r.name), r.db, r.rp}
 	}
 
 	return ctx.Send(&query.Result{
 		Series: []*models.Row{{
 			Name:    "measurements",
-			Columns: []string{"name"},
+			Columns: []string{"name", "database", "retention policy"},
 			Values:  values,
 		}},
 	})
@@ -791,6 +865,24 @@ func (e *StatementExecutor) executeShowRetentionPoliciesStatement(q *influxql.Sh
 	return []*models.Row{row}, nil
 }
 
+func (e *StatementExecutor) executeShowServersStatement(q *influxql.ShowServersStatement) (models.Rows, error) {
+	nis := e.MetaClient.DataNodes()
+	dataNodes := &models.Row{Columns: []string{"id", "http_addr", "tcp_addr"}}
+	dataNodes.Name = "data_nodes"
+	for _, ni := range nis {
+		dataNodes.Values = append(dataNodes.Values, []interface{}{ni.ID, ni.Addr, ni.TCPAddr})
+	}
+
+	nis = e.MetaClient.MetaNodes()
+	metaNodes := &models.Row{Columns: []string{"id", "http_addr", "tcp_addr"}}
+	metaNodes.Name = "meta_nodes"
+	for _, ni := range nis {
+		metaNodes.Values = append(metaNodes.Values, []interface{}{ni.ID, ni.Addr, ni.TCPAddr})
+	}
+
+	return []*models.Row{dataNodes, metaNodes}, nil
+}
+
 func (e *StatementExecutor) executeShowShardsStatement(stmt *influxql.ShowShardsStatement) (models.Rows, error) {
 	dis := e.MetaClient.Databases()
 
@@ -810,7 +902,10 @@ func (e *StatementExecutor) executeShowShardsStatement(stmt *influxql.ShowShards
 					for i, owner := range si.Owners {
 						ownerIDs[i] = owner.NodeID
 					}
-
+					expiry := ""
+					if rpi.Duration != 0 {
+						expiry = sgi.EndTime.Add(rpi.Duration).UTC().Format(time.RFC3339)
+					}
 					row.Values = append(row.Values, []interface{}{
 						si.ID,
 						di.Name,
@@ -818,7 +913,7 @@ func (e *StatementExecutor) executeShowShardsStatement(stmt *influxql.ShowShards
 						sgi.ID,
 						sgi.StartTime.UTC().Format(time.RFC3339),
 						sgi.EndTime.UTC().Format(time.RFC3339),
-						sgi.EndTime.Add(rpi.Duration).UTC().Format(time.RFC3339),
+						expiry,
 						joinUint64(ownerIDs),
 					})
 				}
@@ -1036,10 +1131,31 @@ func (e *StatementExecutor) executeShowTagValues(ctx *query.ExecutionContext, q 
 		return err
 	}
 
-	// Get all shards for all retention policies.
+	// If measurements include retention policies
+	// only look at those policies
+	rps := make([]string, 0, len(di.RetentionPolicies))
+	// Collect retention policies if specified
+	for _, m := range q.Sources.Measurements() {
+		if len(m.RetentionPolicy) > 0 {
+			rps = append(rps, m.RetentionPolicy)
+		}
+	}
+	// If no retention policies specified, use
+	// all retention policies
+	if len(rps) == 0 {
+		for _, rp := range di.RetentionPolicies {
+			rps = append(rps, rp.Name)
+		}
+	} else {
+		for _, rp := range rps {
+			if rp != rps[0] {
+				return fmt.Errorf("only one retention policy allowed in SHOW TAG VALUES query: \"%s\", \"%s\"", rp, rps[0])
+			}
+		}
+	}
 	var allGroups []meta.ShardGroupInfo
-	for _, rpi := range di.RetentionPolicies {
-		sgis, err := e.MetaClient.ShardGroupsByTimeRange(q.Database, rpi.Name, timeRange.MinTime(), timeRange.MaxTime())
+	for _, rp := range rps {
+		sgis, err := e.MetaClient.ShardGroupsByTimeRange(q.Database, rp, timeRange.MinTime(), timeRange.MaxTime())
 		if err != nil {
 			return err
 		}
@@ -1309,6 +1425,8 @@ func (e *StatementExecutor) NormalizeStatement(stmt influxql.Statement, defaultD
 			case *influxql.DropSeriesStatement, *influxql.DeleteSeriesStatement:
 				// DB and RP not supported by these statements so don't rewrite into invalid
 				// statements
+			case *influxql.ShowTagValuesStatement:
+				// SHOW TAG VALUES should span multiple RPs if one is not specified.
 			default:
 				err = e.normalizeMeasurement(node, defaultDatabase, defaultRetentionPolicy)
 			}
@@ -1362,6 +1480,10 @@ type IntoWriteRequest struct {
 
 // TSDBStore is an interface for accessing the time series data store.
 type TSDBStore interface {
+	ShardIDs() []uint64
+	Shard(id uint64) *tsdb.Shard
+	ShardGroup(ids []uint64) tsdb.ShardGroup
+
 	CreateShard(database, policy string, shardID uint64, enabled bool) error
 	WriteToShard(shardID uint64, points []models.Point) error
 
@@ -1374,25 +1496,256 @@ type TSDBStore interface {
 	DeleteSeries(database string, sources []influxql.Source, condition influxql.Expr) error
 	DeleteShard(id uint64) error
 
-	MeasurementNames(ctx context.Context, auth query.FineAuthorizer, database string, cond influxql.Expr) ([][]byte, error)
+	MeasurementNames(ctx context.Context, auth query.FineAuthorizer, database string, retentionPolicy string, cond influxql.Expr) ([][]byte, error)
 	TagKeys(ctx context.Context, auth query.FineAuthorizer, shardIDs []uint64, cond influxql.Expr) ([]tsdb.TagKeys, error)
 	TagValues(ctx context.Context, auth query.FineAuthorizer, shardIDs []uint64, cond influxql.Expr) ([]tsdb.TagValues, error)
 
 	SeriesCardinality(ctx context.Context, database string) (int64, error)
 	MeasurementsCardinality(ctx context.Context, database string) (int64, error)
+	SeriesSketches(ctx context.Context, database string) (estimator.Sketch, estimator.Sketch, error)
+	MeasurementsSketches(ctx context.Context, database string) (estimator.Sketch, estimator.Sketch, error)
 }
 
-var _ TSDBStore = LocalTSDBStore{}
+var _ TSDBStore = ClusterTSDBStore{}
 
-// LocalTSDBStore embeds a tsdb.Store and implements IteratorCreator
+// ClusterTSDBStore embeds a tsdb.Store and implements cluster tsdb store
 // to satisfy the TSDBStore interface.
-type LocalTSDBStore struct {
+type ClusterTSDBStore struct {
 	*tsdb.Store
+
+	MetaExecutor *MetaExecutor
 }
 
-// ShardIteratorCreator is an interface for creating an IteratorCreator to access a specific shard.
-type ShardIteratorCreator interface {
-	ShardIteratorCreator(id uint64) query.IteratorCreator
+func (s ClusterTSDBStore) DeleteDatabase(name string) error {
+	var g errgroup.Group
+	g.Go(func() error {
+		return s.Store.DeleteDatabase(name)
+	})
+	g.Go(func() error {
+		stmt := &influxql.DropDatabaseStatement{Name: name}
+		return s.MetaExecutor.ExecuteStatement(stmt, "")
+	})
+	return g.Wait()
+}
+
+func (s ClusterTSDBStore) DeleteMeasurement(database, name string) error {
+	var g errgroup.Group
+	g.Go(func() error {
+		return s.Store.DeleteMeasurement(database, name)
+	})
+	g.Go(func() error {
+		stmt := &influxql.DropMeasurementStatement{Name: name}
+		return s.MetaExecutor.ExecuteStatement(stmt, database)
+	})
+	return g.Wait()
+}
+
+func (s ClusterTSDBStore) DeleteRetentionPolicy(database, name string) error {
+	var g errgroup.Group
+	g.Go(func() error {
+		return s.Store.DeleteRetentionPolicy(database, name)
+	})
+	g.Go(func() error {
+		stmt := &influxql.DropRetentionPolicyStatement{Name: name, Database: database}
+		return s.MetaExecutor.ExecuteStatement(stmt, database)
+	})
+	return g.Wait()
+}
+
+func (s ClusterTSDBStore) DeleteSeries(database string, sources []influxql.Source, condition influxql.Expr) error {
+	var g errgroup.Group
+	g.Go(func() error {
+		return s.Store.DeleteSeries(database, sources, condition)
+	})
+	g.Go(func() error {
+		stmt := &influxql.DropSeriesStatement{Sources: sources, Condition: condition}
+		return s.MetaExecutor.ExecuteStatement(stmt, database)
+	})
+	return g.Wait()
+}
+
+func (s ClusterTSDBStore) DeleteShard(id uint64) error {
+	var g errgroup.Group
+	g.Go(func() error {
+		return s.Store.DeleteShard(id)
+	})
+	g.Go(func() error {
+		stmt := &influxql.DropShardStatement{ID: id}
+		return s.MetaExecutor.ExecuteStatement(stmt, "")
+	})
+	return g.Wait()
+}
+
+func (s ClusterTSDBStore) MeasurementNames(ctx context.Context, auth query.FineAuthorizer, database string, retentionPolicy string, cond influxql.Expr) ([][]byte, error) {
+	fn := func() (interface{}, error) {
+		return s.Store.MeasurementNames(ctx, auth, database, retentionPolicy, cond)
+	}
+	rfn := func(nodeID uint64) (interface{}, error) {
+		return s.MetaExecutor.MeasurementNames(nodeID, database, retentionPolicy, cond)
+	}
+	results, _ := s.MetaExecutor.ExecuteQuery(fn, rfn)
+
+	var names [][]byte
+	for _, result := range results {
+		entries, ok := result.([][]byte)
+		if !ok {
+			continue
+		}
+		names = append(names, entries...)
+	}
+
+	names = bytesutil.SortDedup(names)
+	return names, nil
+}
+
+func (s ClusterTSDBStore) TagKeys(ctx context.Context, auth query.FineAuthorizer, shardIDs []uint64, cond influxql.Expr) ([]tsdb.TagKeys, error) {
+	fn := func() (interface{}, error) {
+		return s.Store.TagKeys(ctx, auth, shardIDs, cond)
+	}
+	rfn := func(nodeID uint64) (interface{}, error) {
+		return s.MetaExecutor.TagKeys(nodeID, shardIDs, cond)
+	}
+	results, _ := s.MetaExecutor.ExecuteQuery(fn, rfn)
+
+	tagKeysSet := make(map[string]map[string]struct{})
+	for _, result := range results {
+		entries, ok := result.([]tsdb.TagKeys)
+		if !ok {
+			continue
+		}
+		for _, tagKey := range entries {
+			keys, ok := tagKeysSet[tagKey.Measurement]
+			if !ok {
+				keys = make(map[string]struct{})
+			}
+			for _, key := range tagKey.Keys {
+				keys[key] = struct{}{}
+			}
+			tagKeysSet[tagKey.Measurement] = keys
+		}
+	}
+
+	var tagKeys []tsdb.TagKeys
+	for m, keys := range tagKeysSet {
+		tagKey := tsdb.TagKeys{Measurement: m}
+		for key := range keys {
+			tagKey.Keys = append(tagKey.Keys, key)
+		}
+		sort.Sort(sort.StringSlice(tagKey.Keys))
+		tagKeys = append(tagKeys, tagKey)
+	}
+
+	sort.Sort(tsdb.TagKeysSlice(tagKeys))
+	return tagKeys, nil
+}
+
+func (s ClusterTSDBStore) TagValues(ctx context.Context, auth query.FineAuthorizer, shardIDs []uint64, cond influxql.Expr) ([]tsdb.TagValues, error) {
+	fn := func() (interface{}, error) {
+		return s.Store.TagValues(ctx, auth, shardIDs, cond)
+	}
+	rfn := func(nodeID uint64) (interface{}, error) {
+		return s.MetaExecutor.TagValues(nodeID, shardIDs, cond)
+	}
+	results, _ := s.MetaExecutor.ExecuteQuery(fn, rfn)
+
+	tagValuesSet := make(map[string]map[tsdb.KeyValue]struct{})
+	for _, result := range results {
+		entries, ok := result.([]tsdb.TagValues)
+		if !ok {
+			continue
+		}
+		for _, tagValue := range entries {
+			values, ok := tagValuesSet[tagValue.Measurement]
+			if !ok {
+				values = make(map[tsdb.KeyValue]struct{})
+			}
+			for _, value := range tagValue.Values {
+				values[value] = struct{}{}
+			}
+			tagValuesSet[tagValue.Measurement] = values
+		}
+	}
+
+	var tagValues []tsdb.TagValues
+	for m, values := range tagValuesSet {
+		tagValue := tsdb.TagValues{Measurement: m}
+		for value := range values {
+			tagValue.Values = append(tagValue.Values, value)
+		}
+		sort.Sort(tsdb.KeyValues(tagValue.Values))
+		tagValues = append(tagValues, tagValue)
+	}
+
+	sort.Sort(tsdb.TagValuesSlice(tagValues))
+	return tagValues, nil
+}
+
+func (s ClusterTSDBStore) SeriesCardinality(ctx context.Context, database string) (int64, error) {
+	fn := func() (interface{}, error) {
+		ss, ts, err := s.Store.SeriesSketches(ctx, database)
+		return []estimator.Sketch{ss, ts}, err
+	}
+	rfn := func(nodeID uint64) (interface{}, error) {
+		ss, ts, err := s.MetaExecutor.SeriesSketches(nodeID, database)
+		return []estimator.Sketch{ss, ts}, err
+	}
+	results, _ := s.MetaExecutor.ExecuteQuery(fn, rfn)
+
+	var ss estimator.Sketch
+	var ts estimator.Sketch
+	for _, result := range results {
+		sketches, ok := result.([]estimator.Sketch)
+		if !ok {
+			continue
+		}
+		s, t := sketches[0], sketches[1]
+		if ss == nil {
+			ss, ts = s, t
+		} else if err := ss.Merge(s); err != nil {
+			return 0, err
+		} else if err = ts.Merge(t); err != nil {
+			return 0, err
+		}
+	}
+
+	if ss == nil {
+		return 0, nil
+	}
+	return int64(ss.Count() - ts.Count()), nil
+}
+
+func (s ClusterTSDBStore) MeasurementsCardinality(ctx context.Context, database string) (int64, error) {
+	fn := func() (interface{}, error) {
+		ss, ts, err := s.Store.MeasurementsSketches(ctx, database)
+		return []estimator.Sketch{ss, ts}, err
+	}
+	rfn := func(nodeID uint64) (interface{}, error) {
+		ss, ts, err := s.MetaExecutor.MeasurementsSketches(nodeID, database)
+		return []estimator.Sketch{ss, ts}, err
+	}
+	results, _ := s.MetaExecutor.ExecuteQuery(fn, rfn)
+
+	var ss estimator.Sketch
+	var ts estimator.Sketch
+	for _, result := range results {
+		sketches, ok := result.([]estimator.Sketch)
+		if !ok {
+			continue
+		}
+		s, t := sketches[0], sketches[1]
+		if ss == nil {
+			ss, ts = s, t
+		} else if err := ss.Merge(s); err != nil {
+			return 0, err
+		} else if err = ts.Merge(t); err != nil {
+			return 0, err
+		}
+	}
+
+	if ss == nil {
+		return 0, nil
+	}
+	return int64(ss.Count() - ts.Count()), nil
 }
 
 // joinUint64 returns a comma-delimited string of uint64 numbers.
@@ -1406,3 +1759,112 @@ func joinUint64(a []uint64) string {
 	}
 	return buf.String()
 }
+
+// ClusterTaskManager embeds a query.TaskManager and implements cluster task manager
+// to satisfy the query.StatementExecutor interface.
+type ClusterTaskManager struct {
+	*query.TaskManager
+
+	MetaExecutor *MetaExecutor
+}
+
+// ExecuteStatement executes a statement containing one of the task management queries.
+func (t *ClusterTaskManager) ExecuteStatement(ctx *query.ExecutionContext, stmt influxql.Statement) error {
+	switch stmt := stmt.(type) {
+	case *influxql.ShowQueriesStatement:
+		rows, err := t.executeShowQueriesStatement(stmt)
+		if err != nil {
+			return err
+		}
+		ctx.Send(&query.Result{
+			Series: rows,
+		})
+	case *influxql.KillQueryStatement:
+		return t.executeKillQueryStatement(ctx, stmt)
+	default:
+		return query.ErrInvalidQuery
+	}
+	return nil
+}
+
+func (t *ClusterTaskManager) executeKillQueryStatement(ctx *query.ExecutionContext, stmt *influxql.KillQueryStatement) error {
+	if stmt.Host == "" {
+		return errors.New("tcp host required")
+	}
+	node, err := t.MetaExecutor.MetaClient.DataNodeByTCPAddr(stmt.Host)
+	if err != nil {
+		return err
+	}
+	localID := t.MetaExecutor.MetaClient.NodeID()
+	if localID == node.ID {
+		return t.TaskManager.ExecuteStatement(ctx, stmt)
+	}
+	if _, err := t.MetaExecutor.TaskManagerStatement(node.ID, stmt); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *ClusterTaskManager) executeShowQueriesStatement(stmt influxql.Statement) (models.Rows, error) {
+	fn := func() (interface{}, error) {
+		ctx := &query.ExecutionContext{
+			Context: context.Background(),
+			Results: make(chan *query.Result, 1),
+		}
+		err := t.TaskManager.ExecuteStatement(ctx, stmt)
+		if err != nil {
+			return nil, err
+		}
+		result := <-ctx.Results
+		localID := t.MetaExecutor.MetaClient.NodeID()
+		return &QueriesResult{NodeID: localID, Rows: result.Series}, nil
+	}
+	rfn := func(nodeID uint64) (interface{}, error) {
+		result, err := t.MetaExecutor.TaskManagerStatement(nodeID, stmt)
+		if err != nil {
+			return nil, err
+		}
+		return &QueriesResult{NodeID: nodeID, Rows: result.Series}, nil
+	}
+	results, _ := t.MetaExecutor.ExecuteQuery(fn, rfn)
+
+	queries := make(QueriesResults, 0, len(results))
+	for _, result := range results {
+		qr, ok := result.(*QueriesResult)
+		if !ok {
+			continue
+		}
+		if qr == nil || len(qr.Rows) == 0 || len(qr.Rows[0].Values) == 0 {
+			continue
+		}
+		queries = append(queries, qr)
+	}
+	sort.Sort(queries)
+
+	values := make([][]interface{}, 0, len(queries))
+	for _, qr := range queries {
+		node, err := t.MetaExecutor.MetaClient.DataNode(qr.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		for _, v := range qr.Rows[0].Values {
+			values = append(values, []interface{}{v[0], node.ID, node.TCPAddr, v[1], v[2], v[3], v[4]})
+		}
+	}
+
+	return []*models.Row{{
+		Columns: []string{"qid", "node_id", "tcp_host", "query", "database", "duration", "status"},
+		Values:  values,
+	}}, nil
+}
+
+type QueriesResult struct {
+	NodeID uint64
+	Rows   models.Rows
+}
+
+type QueriesResults []*QueriesResult
+
+func (a QueriesResults) Len() int           { return len(a) }
+func (a QueriesResults) Less(i, j int) bool { return a[i].NodeID < a[j].NodeID }
+func (a QueriesResults) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }

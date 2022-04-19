@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -83,6 +82,13 @@ func (cmd *Command) Run(args ...string) error {
 		return fmt.Errorf("apply env config: %v", err)
 	}
 
+	if options.Hostname != "" {
+		config.Hostname = options.Hostname
+	}
+
+	// Propagate the top-level gossip-frequency down to dependent configs
+	config.Meta.GossipFrequency = config.GossipFrequency
+
 	// Validate the configuration.
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("%s. To generate a valid configuration file run `influxd config > influxdb.generated.conf`", err)
@@ -118,6 +124,8 @@ func (cmd *Command) Run(args ...string) error {
 	// If there was an error on startup when creating the logger, output it now.
 	if logErr != nil {
 		cmd.Logger.Error("Unable to configure logger", zap.Error(logErr))
+	} else {
+		logger.New(cmd.Stderr).Info("configured logger", zap.String("format", config.Logging.Format), zap.String("level", config.Logging.Level.String()))
 	}
 
 	// Write the PID file.
@@ -193,9 +201,8 @@ func (cmd *Command) ParseFlags(args ...string) (Options, error) {
 	var options Options
 	fs := flag.NewFlagSet("", flag.ContinueOnError)
 	fs.StringVar(&options.ConfigPath, "config", "", "")
+	fs.StringVar(&options.Hostname, "hostname", "", "")
 	fs.StringVar(&options.PIDFile, "pidfile", "", "")
-	// Ignore hostname option.
-	_ = fs.String("hostname", "", "")
 	fs.StringVar(&options.CPUProfile, "cpuprofile", "", "")
 	fs.StringVar(&options.MemProfile, "memprofile", "", "")
 	fs.Usage = func() { fmt.Fprintln(cmd.Stderr, usage) }
@@ -219,7 +226,7 @@ func (cmd *Command) writePIDFile(path string) error {
 
 	// Retrieve the PID and write it.
 	pid := strconv.Itoa(os.Getpid())
-	if err := ioutil.WriteFile(path, []byte(pid), 0666); err != nil {
+	if err := os.WriteFile(path, []byte(pid), 0666); err != nil {
 		return fmt.Errorf("write file: %s", err)
 	}
 
@@ -256,17 +263,21 @@ Usage: influxd run [flags]
             is present at any of these locations.
             Disable the automatic loading of a configuration file using
             the null device (such as /dev/null).
+    -hostname <name>
+            Override the hostname, the 'hostname' configuration
+            option will be overridden.
     -pidfile <path>
             Write process ID to a file.
     -cpuprofile <path>
             Write CPU profiling information to a file.
     -memprofile <path>
             Write memory usage information to a file.
-`
+ `
 
 // Options represents the command line options that can be parsed.
 type Options struct {
 	ConfigPath string
+	Hostname   string
 	PIDFile    string
 	CPUProfile string
 	MemProfile string
@@ -274,11 +285,11 @@ type Options struct {
 
 // GetConfigPath returns the config path from the options.
 // It will return a path by searching in this order:
-//   1. The CLI option in ConfigPath
-//   2. The environment variable INFLUXDB_CONFIG_PATH
-//   3. The first influxdb.conf file on the path:
-//        - ~/.influxdb
-//        - /etc/influxdb
+//  1. The CLI option in ConfigPath
+//  2. The environment variable INFLUXDB_CONFIG_PATH
+//  3. The first influxdb.conf file on the path:
+//     - ~/.influxdb
+//     - /etc/influxdb
 func (opt *Options) GetConfigPath() string {
 	if opt.ConfigPath != "" {
 		if opt.ConfigPath == os.DevNull {

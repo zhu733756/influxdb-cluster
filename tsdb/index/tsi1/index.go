@@ -3,7 +3,6 @@ package tsi1
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,6 +20,7 @@ import (
 	"github.com/influxdata/influxdb/tsdb"
 	"github.com/influxdata/influxql"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 )
 
 // IndexName is the name of the index.
@@ -53,7 +53,6 @@ func init() {
 //
 // NOTE: Currently, this must not be change once a database is created. Further,
 // it must also be a power of 2.
-//
 var DefaultPartitionN uint64 = 8
 
 // An IndexOption is a functional option for changing the configuration of
@@ -185,6 +184,7 @@ func NewIndex(sfile *tsdb.SeriesFile, database string, options ...IndexOption) *
 func (i *Index) Bytes() int {
 	var b int
 	i.mu.RLock()
+	defer i.mu.RUnlock()
 	b += 24 // mu RWMutex is 24 bytes
 	b += int(unsafe.Sizeof(i.partitions))
 	for _, p := range i.partitions {
@@ -204,7 +204,6 @@ func (i *Index) Bytes() int {
 	b += int(unsafe.Sizeof(i.database)) + len(i.database)
 	b += int(unsafe.Sizeof(i.version))
 	b += int(unsafe.Sizeof(i.PartitionN))
-	i.mu.RUnlock()
 	return b
 }
 
@@ -242,7 +241,7 @@ func (i *Index) SeriesIDSet() *tsdb.SeriesIDSet {
 }
 
 // Open opens the index.
-func (i *Index) Open() error {
+func (i *Index) Open() (rErr error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
@@ -270,29 +269,16 @@ func (i *Index) Open() error {
 	partitionN := len(i.partitions)
 	n := i.availableThreads()
 
-	// Store results.
-	errC := make(chan error, partitionN)
-
 	// Run fn on each partition using a fixed number of goroutines.
-	var pidx uint32 // Index of maximum Partition being worked on.
-	for k := 0; k < n; k++ {
-		go func(k int) {
-			for {
-				idx := int(atomic.AddUint32(&pidx, 1) - 1) // Get next partition to work on.
-				if idx >= partitionN {
-					return // No more work.
-				}
-				err := i.partitions[idx].Open()
-				errC <- err
-			}
-		}(k)
+	g := new(errgroup.Group)
+	g.SetLimit(n)
+	for idx := 0; idx < partitionN; idx++ {
+		g.Go(i.partitions[idx].Open)
 	}
-
-	// Check for error
-	for i := 0; i < partitionN; i++ {
-		if err := <-errC; err != nil {
-			return err
-		}
+	err := g.Wait()
+	defer i.cleanUpFail(&rErr)
+	if err != nil {
+		return err
 	}
 
 	// Refresh cached sketches.
@@ -306,6 +292,18 @@ func (i *Index) Open() error {
 	i.opened = true
 	i.logger.Info(fmt.Sprintf("index opened with %d partitions", partitionN))
 	return nil
+}
+
+func (i *Index) cleanUpFail(err *error) {
+	if nil != *err {
+		for _, p := range i.partitions {
+			if (p != nil) && p.IsOpen() {
+				if e := p.Close(); e != nil {
+					i.logger.Warn("Failed to clean up partition")
+				}
+			}
+		}
+	}
 }
 
 // Compact requests a compaction of partitions.
@@ -874,10 +872,10 @@ func (i *Index) DropSeriesList(seriesIDs []uint64, keys [][]byte, _ bool) error 
 
 	// Add sketch tombstone.
 	i.mu.Lock()
+	defer i.mu.Unlock()
 	for _, key := range keys {
 		i.sTSketch.Add(key)
 	}
-	i.mu.Unlock()
 
 	return nil
 }
@@ -1064,6 +1062,7 @@ func (i *Index) TagValueSeriesIDIterator(name, key, value []byte) (tsdb.SeriesID
 	for _, p := range i.partitions {
 		itr, err := p.TagValueSeriesIDIterator(name, key, value)
 		if err != nil {
+			tsdb.SeriesIDIterators(a).Close()
 			return nil, err
 		} else if itr != nil {
 			a = append(a, itr)
@@ -1176,7 +1175,7 @@ func (i *Index) Rebuild() {}
 
 // IsIndexDir returns true if directory contains at least one partition directory.
 func IsIndexDir(path string) (bool, error) {
-	fis, err := ioutil.ReadDir(path)
+	fis, err := os.ReadDir(path)
 	if err != nil {
 		return false, err
 	}

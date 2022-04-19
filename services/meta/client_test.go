@@ -1,7 +1,6 @@
 package meta_test
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"reflect"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/toml"
 
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxql"
@@ -19,8 +19,9 @@ import (
 func TestMetaClient_CreateDatabaseOnly(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	if db, err := c.CreateDatabase("db0"); err != nil {
@@ -50,8 +51,9 @@ func TestMetaClient_CreateDatabaseOnly(t *testing.T) {
 func TestMetaClient_CreateDatabaseIfNotExists(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	if _, err := c.CreateDatabase("db0"); err != nil {
@@ -73,8 +75,9 @@ func TestMetaClient_CreateDatabaseIfNotExists(t *testing.T) {
 func TestMetaClient_CreateDatabaseWithRetentionPolicy(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	// Calling CreateDatabaseWithRetentionPolicy with a nil spec should return
@@ -134,8 +137,9 @@ func TestMetaClient_CreateDatabaseWithRetentionPolicy(t *testing.T) {
 func TestMetaClient_CreateDatabaseWithRetentionPolicy_Conflict_Fields(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	duration := 1 * time.Hour
@@ -184,8 +188,9 @@ func TestMetaClient_CreateDatabaseWithRetentionPolicy_Conflict_Fields(t *testing
 func TestMetaClient_CreateDatabaseWithRetentionPolicy_Conflict_NonDefault(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	duration := 1 * time.Hour
@@ -219,8 +224,9 @@ func TestMetaClient_CreateDatabaseWithRetentionPolicy_Conflict_NonDefault(t *tes
 func TestMetaClient_Databases(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	// Create two databases.
@@ -256,8 +262,9 @@ func TestMetaClient_Databases(t *testing.T) {
 func TestMetaClient_DropDatabase(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	if _, err := c.CreateDatabase("db0"); err != nil {
@@ -288,8 +295,9 @@ func TestMetaClient_DropDatabase(t *testing.T) {
 func TestMetaClient_CreateRetentionPolicy(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	if _, err := c.CreateDatabase("db0"); err != nil {
@@ -351,7 +359,7 @@ func TestMetaClient_CreateRetentionPolicy(t *testing.T) {
 		Duration:           &rp1.Duration,
 		ShardGroupDuration: rp1.ShardGroupDuration,
 	}, true)
-	if exp := meta.ErrRetentionPolicyExists; got != exp {
+	if exp := meta.ErrRetentionPolicyExists; got == nil || got.Error() != exp.Error() {
 		t.Fatalf("got error %v, expected error %v", got, exp)
 	}
 
@@ -366,7 +374,7 @@ func TestMetaClient_CreateRetentionPolicy(t *testing.T) {
 		Duration:           &rp1.Duration,
 		ShardGroupDuration: rp1.ShardGroupDuration,
 	}, true)
-	if exp := meta.ErrRetentionPolicyExists; got != exp {
+	if exp := meta.ErrRetentionPolicyExists; got == nil || got.Error() != exp.Error() {
 		t.Fatalf("got error %v, expected error %v", got, exp)
 	}
 
@@ -381,7 +389,7 @@ func TestMetaClient_CreateRetentionPolicy(t *testing.T) {
 		Duration:           &rp1.Duration,
 		ShardGroupDuration: rp1.ShardGroupDuration,
 	}, true)
-	if exp := meta.ErrRetentionPolicyExists; got != exp {
+	if exp := meta.ErrRetentionPolicyExists; got == nil || got.Error() != exp.Error() {
 		t.Fatalf("got error %v, expected error %v", got, exp)
 	}
 
@@ -397,7 +405,7 @@ func TestMetaClient_CreateRetentionPolicy(t *testing.T) {
 		Duration:           &rp1.Duration,
 		ShardGroupDuration: rp1.ShardGroupDuration,
 	}, true)
-	if exp := meta.ErrIncompatibleDurations; got != exp {
+	if exp := meta.ErrIncompatibleDurations; got == nil || got.Error() != exp.Error() {
 		t.Fatalf("got error %v, expected error %v", got, exp)
 	}
 }
@@ -405,8 +413,9 @@ func TestMetaClient_CreateRetentionPolicy(t *testing.T) {
 func TestMetaClient_DefaultRetentionPolicy(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	duration := 1 * time.Hour
@@ -446,8 +455,9 @@ func TestMetaClient_DefaultRetentionPolicy(t *testing.T) {
 func TestMetaClient_UpdateRetentionPolicy(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	if _, err := c.CreateDatabaseWithRetentionPolicy("db0", &meta.RetentionPolicySpec{
@@ -487,7 +497,7 @@ func TestMetaClient_UpdateRetentionPolicy(t *testing.T) {
 		Duration: &duration,
 	}, true); err == nil {
 		t.Fatal("expected error")
-	} else if err != meta.ErrIncompatibleDurations {
+	} else if err.Error() != meta.ErrIncompatibleDurations.Error() {
 		t.Fatalf("expected error '%s', got '%s'", meta.ErrIncompatibleDurations, err)
 	}
 
@@ -497,7 +507,7 @@ func TestMetaClient_UpdateRetentionPolicy(t *testing.T) {
 		ShardGroupDuration: &sgDuration,
 	}, true); err == nil {
 		t.Fatal("expected error")
-	} else if err != meta.ErrIncompatibleDurations {
+	} else if err.Error() != meta.ErrIncompatibleDurations.Error() {
 		t.Fatalf("expected error '%s', got '%s'", meta.ErrIncompatibleDurations, err)
 	}
 
@@ -509,7 +519,7 @@ func TestMetaClient_UpdateRetentionPolicy(t *testing.T) {
 		ShardGroupDuration: &sgDuration,
 	}, true); err == nil {
 		t.Fatal("expected error")
-	} else if err != meta.ErrIncompatibleDurations {
+	} else if err.Error() != meta.ErrIncompatibleDurations.Error() {
 		t.Fatalf("expected error '%s', got '%s'", meta.ErrIncompatibleDurations, err)
 	}
 
@@ -527,8 +537,9 @@ func TestMetaClient_UpdateRetentionPolicy(t *testing.T) {
 func TestMetaClient_DropRetentionPolicy(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	if _, err := c.CreateDatabase("db0"); err != nil {
@@ -578,8 +589,9 @@ func TestMetaClient_DropRetentionPolicy(t *testing.T) {
 func TestMetaClient_CreateUser(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	// Create an admin user
@@ -748,8 +760,9 @@ func TestMetaClient_CreateUser(t *testing.T) {
 func TestMetaClient_UpdateUser(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	// UpdateUser that doesn't exist should return an error.
@@ -761,8 +774,9 @@ func TestMetaClient_UpdateUser(t *testing.T) {
 func TestMetaClient_ContinuousQueries(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	// Create a database to use
@@ -817,8 +831,9 @@ func TestMetaClient_ContinuousQueries(t *testing.T) {
 func TestMetaClient_Subscriptions_Create(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	// Create a database to use
@@ -874,8 +889,9 @@ func TestMetaClient_Subscriptions_Create(t *testing.T) {
 func TestMetaClient_Subscriptions_Drop(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
 
 	// Create a database to use
@@ -919,9 +935,20 @@ func TestMetaClient_Subscriptions_Drop(t *testing.T) {
 func TestMetaClient_Shards(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
+
+	exp := &meta.NodeInfo{
+		ID:      2,
+		Addr:    "foo:8180",
+		TCPAddr: "bar:8281",
+	}
+
+	if _, err := c.CreateDataNode(exp.Addr, exp.TCPAddr); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := c.CreateDatabase("db0"); err != nil {
 		t.Fatal(err)
@@ -975,9 +1002,14 @@ func TestMetaClient_Shards(t *testing.T) {
 func TestMetaClient_CreateShardGroupIdempotent(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
+
+	if _, err := c.CreateDataNode("foo:8086", "bar:8088"); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := c.CreateDatabase("db0"); err != nil {
 		t.Fatal(err)
@@ -1029,9 +1061,14 @@ func TestMetaClient_CreateShardGroupIdempotent(t *testing.T) {
 func TestMetaClient_PruneShardGroups(t *testing.T) {
 	t.Parallel()
 
-	d, c := newClient()
+	d, s, c := newServiceAndClient()
 	defer os.RemoveAll(d)
+	defer s.Close()
 	defer c.Close()
+
+	if _, err := c.CreateDataNode("foo:8086", "bar:8088"); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := c.CreateDatabase("db0"); err != nil {
 		t.Fatal(err)
@@ -1109,9 +1146,16 @@ func TestMetaClient_PersistClusterIDAfterRestart(t *testing.T) {
 	t.Parallel()
 
 	cfg := newConfig()
+	cfg.SingleServer = true
 	defer os.RemoveAll(cfg.Dir)
+	s := newService(cfg)
+	if err := s.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
 
 	c := meta.NewClient(cfg)
+	c.SetMetaServers([]string{s.HTTPAddr()})
 	if err := c.Open(); err != nil {
 		t.Fatal(err)
 	}
@@ -1120,7 +1164,15 @@ func TestMetaClient_PersistClusterIDAfterRestart(t *testing.T) {
 		t.Fatal("cluster ID can't be zero")
 	}
 
+	s.Close()
+	s = newService(cfg)
+	if err := s.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
 	c = meta.NewClient(cfg)
+	c.SetMetaServers([]string{s.HTTPAddr()})
 	if err := c.Open(); err != nil {
 		t.Fatal(err)
 	}
@@ -1134,18 +1186,21 @@ func TestMetaClient_PersistClusterIDAfterRestart(t *testing.T) {
 	}
 }
 
-func newClient() (string, *meta.Client) {
-	cfg := newConfig()
+func newClient(cfg *meta.Config) *meta.Client {
 	c := meta.NewClient(cfg)
+	c.SetMetaServers([]string{cfg.HTTPBindAddress})
 	if err := c.Open(); err != nil {
 		panic(err)
 	}
-	return cfg.Dir, c
+	return c
 }
 
 func newConfig() *meta.Config {
 	cfg := meta.NewConfig()
+	cfg.BindAddress = freePort()
+	cfg.HTTPBindAddress = freePort()
 	cfg.Dir = testTempDir(2)
+	cfg.LeaseDuration = toml.Duration(1 * time.Second)
 	return cfg
 }
 
@@ -1157,7 +1212,7 @@ func testTempDir(skip int) string {
 	}
 	_, prefix := path.Split(runtime.FuncForPC(pc).Name())
 	// Make a temp dir prefixed with calling function's name.
-	dir, err := ioutil.TempDir(os.TempDir(), prefix)
+	dir, err := os.MkdirTemp(os.TempDir(), prefix)
 	if err != nil {
 		panic(err)
 	}

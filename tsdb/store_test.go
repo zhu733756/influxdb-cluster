@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"os"
@@ -28,6 +27,7 @@ import (
 	"github.com/influxdata/influxdb/tsdb"
 	"github.com/influxdata/influxdb/tsdb/index/inmem"
 	"github.com/influxdata/influxql"
+	"github.com/stretchr/testify/require"
 )
 
 // Ensure the store can delete a retention policy and all shards under
@@ -141,6 +141,31 @@ func TestStore_CreateShard(t *testing.T) {
 
 	for _, index := range tsdb.RegisteredIndexes() {
 		t.Run(index, func(t *testing.T) { test(index) })
+	}
+}
+
+func TestStore_BadShard(t *testing.T) {
+	const errStr = "a shard open error"
+	indexes := tsdb.RegisteredIndexes()
+	for _, idx := range indexes {
+		func() {
+			s := MustOpenStore(idx)
+			defer require.NoErrorf(t, s.Close(), "closing store with index type: %s", idx)
+
+			sh := tsdb.NewTempShard(idx)
+			err := s.OpenShard(sh.Shard, false)
+			require.NoError(t, err, "opening temp shard")
+			defer require.NoError(t, sh.Close(), "closing temporary shard")
+
+			s.SetShardOpenErrorForTest(sh.ID(), errors.New(errStr))
+			err2 := s.OpenShard(sh.Shard, false)
+			require.Error(t, err2, "no error opening bad shard")
+			require.True(t, errors.Is(err2, tsdb.ErrPreviousShardFail{}), "exp: ErrPreviousShardFail, got: %v", err2)
+			require.EqualError(t, err2, "opening shard previously failed with: "+errStr)
+
+			// This should succeed with the force (and because opening an open shard automatically succeeds)
+			require.NoError(t, s.OpenShard(sh.Shard, true), "forced re-opening previously failing shard")
+		}()
 	}
 }
 
@@ -293,7 +318,7 @@ func TestStore_DropConcurrentWriteMultipleShards(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		measurements, err := s.MeasurementNames(context.Background(), query.OpenAuthorizer, "db0", nil)
+		measurements, err := s.MeasurementNames(context.Background(), query.OpenAuthorizer, "db0", "", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -866,7 +891,7 @@ func TestStore_MeasurementNames_Deduplicate(t *testing.T) {
 			`cpu value=3 20`,
 		)
 
-		meas, err := s.MeasurementNames(context.Background(), query.OpenAuthorizer, "db0", nil)
+		meas, err := s.MeasurementNames(context.Background(), query.OpenAuthorizer, "db0", "", nil)
 		if err != nil {
 			t.Fatalf("unexpected error with MeasurementNames: %v", err)
 		}
@@ -907,7 +932,7 @@ func testStoreCardinalityTombstoning(t *testing.T, store *Store) {
 	}
 
 	// Delete all the series for each measurement.
-	mnames, err := store.MeasurementNames(context.Background(), nil, "db", nil)
+	mnames, err := store.MeasurementNames(context.Background(), nil, "db", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1055,7 +1080,7 @@ func testStoreCardinalityDuplicates(t *testing.T, store *Store) {
 			// For other shards we write a random sub-section of all the points.
 			// which will duplicate the series and shouldn't increase the
 			// cardinality.
-			from, to := rand.Intn(len(points)), rand.Intn(len(points))
+			from, to = rand.Intn(len(points)), rand.Intn(len(points))
 			if from > to {
 				from, to = to, from
 			}
@@ -1162,7 +1187,7 @@ func testStoreMetaQueryTimeout(t *testing.T, store *Store, index string) {
 
 	testStoreMakeTimedFuncs(func(ctx context.Context) (string, error) {
 		const funcName = "MeasurementNames"
-		_, err := store.Store.MeasurementNames(ctx, nil, "db", nil)
+		_, err := store.Store.MeasurementNames(ctx, nil, "db", "", nil)
 		return funcName, err
 	}, index)(t)
 }
@@ -1429,6 +1454,21 @@ func TestStore_Sketches(t *testing.T) {
 		if got, exp := int(tsketch.Count()), tmeasurements; got-exp < -delta(tmeasurements) || got-exp > delta(tmeasurements) {
 			return fmt.Errorf("got measurement tombstone cardinality %d, expected ~%d", got, exp)
 		}
+
+		if mc, err := store.MeasurementsCardinality(context.Background(), "db"); err != nil {
+			return fmt.Errorf("unexpected error from MeasurementsCardinality: %w", err)
+		} else {
+			if mc < 0 {
+				return fmt.Errorf("MeasurementsCardinality returned < 0 (%v)", mc)
+			}
+			expMc := int64(sketch.Count() - tsketch.Count())
+			if expMc < 0 {
+				expMc = 0
+			}
+			if got, exp := int(mc), int(expMc); got-exp < -delta(exp) || got-exp > delta(exp) {
+				return fmt.Errorf("got measurement cardinality %d, expected ~%d", mc, exp)
+			}
+		}
 		return nil
 	}
 
@@ -1472,7 +1512,7 @@ func TestStore_Sketches(t *testing.T) {
 		}
 
 		// Delete half the the measurements data
-		mnames, err := store.MeasurementNames(context.Background(), nil, "db", nil)
+		mnames, err := store.MeasurementNames(context.Background(), nil, "db", "", nil)
 		if err != nil {
 			return err
 		}
@@ -1508,6 +1548,31 @@ func TestStore_Sketches(t *testing.T) {
 		if err := checkCardinalities(store.Store, expS, expTS, expM, expTM); err != nil {
 			return fmt.Errorf("[initial|re-open|delete|re-open] %v", err)
 		}
+
+		// Now delete the rest of the measurements.
+		// This will cause the measurement tombstones to exceed the measurement cardinality for TSI.
+		mnames, err = store.MeasurementNames(context.Background(), nil, "db", "", nil)
+		if err != nil {
+			return err
+		}
+
+		for _, name := range mnames {
+			if err := store.DeleteSeries("db", []influxql.Source{&influxql.Measurement{Name: string(name)}}, nil); err != nil {
+				return err
+			}
+		}
+
+		// Check cardinalities. In this case, the indexes behave differently.
+		expS, expTS, expM, expTM = 80, 159, 5, 10
+		if index == inmem.IndexName {
+			expS, expTS, expM, expTM = 80, 80, 5, 5
+		}
+
+		// Check cardinalities - tombstones should be in
+		if err := checkCardinalities(store.Store, expS, expTS, expM, expTM); err != nil {
+			return fmt.Errorf("[initial|re-open|delete] %v", err)
+		}
+
 		return nil
 	}
 
@@ -1680,7 +1745,7 @@ func TestStore_Measurements_Auth(t *testing.T) {
 			},
 		}
 
-		names, err := s.MeasurementNames(context.Background(), authorizer, "db0", nil)
+		names, err := s.MeasurementNames(context.Background(), authorizer, "db0", "", nil)
 		if err != nil {
 			return err
 		}
@@ -1710,7 +1775,7 @@ func TestStore_Measurements_Auth(t *testing.T) {
 			return err
 		}
 
-		if names, err = s.MeasurementNames(context.Background(), authorizer, "db0", nil); err != nil {
+		if names, err = s.MeasurementNames(context.Background(), authorizer, "db0", "", nil); err != nil {
 			return err
 		}
 
@@ -2009,7 +2074,7 @@ func TestStore_MeasurementNames_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := sh.Open(); err != nil {
+						if err := s.OpenShard(sh, false); err != nil {
 							errC <- err
 							return
 						}
@@ -2026,7 +2091,7 @@ func TestStore_MeasurementNames_ConcurrentDropShard(t *testing.T) {
 					errC <- nil
 					return
 				default:
-					names, err := s.MeasurementNames(context.Background(), nil, "db0", nil)
+					names, err := s.MeasurementNames(context.Background(), nil, "db0", "", nil)
 					if err == tsdb.ErrIndexClosing || err == tsdb.ErrEngineClosed {
 						continue // These errors are expected
 					}
@@ -2094,7 +2159,7 @@ func TestStore_TagKeys_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := sh.Open(); err != nil {
+						if err := s.OpenShard(sh, false); err != nil {
 							errC <- err
 							return
 						}
@@ -2185,7 +2250,7 @@ func TestStore_TagValues_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := sh.Open(); err != nil {
+						if err := s.OpenShard(sh, false); err != nil {
 							errC <- err
 							return
 						}
@@ -2464,7 +2529,7 @@ type Store struct {
 
 // NewStore returns a new instance of Store with a temporary path.
 func NewStore(index string) *Store {
-	path, err := ioutil.TempDir("", "influxdb-tsdb-")
+	path, err := os.MkdirTemp("", "influxdb-tsdb-")
 	if err != nil {
 		panic(err)
 	}

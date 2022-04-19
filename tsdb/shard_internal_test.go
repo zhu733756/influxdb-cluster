@@ -2,7 +2,6 @@ package tsdb
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -17,7 +16,39 @@ import (
 	"github.com/influxdata/influxdb/logger"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxql"
+	"github.com/stretchr/testify/require"
 )
+
+func TestShard_ErrorPrinting(t *testing.T) {
+
+	tests := []struct {
+		nSeq int
+		raw  string
+	}{
+		{1, string([]byte{'b', 'e', 'n', 't', 'e', 's', 't', '\t', '\n'})},
+		{1, string([]byte{'b', 'e', 'n', 't', 'e', 's', 0, 0, 0xFE, 0, 0xFE, 't'})},
+		{2, string([]byte{0, 0, 0, 0, 0xFE, '\t', '\n', '\t', 'b', 'e', 'n', 't', 'e', 's', 't', 0, 0, 0, 0, 0xFE, '\t', '\n', '\t', '\t', '\t'})},
+	}
+
+	for i, _ := range tests {
+		f := makePrintable(tests[i].raw)
+		require.True(t, models.ValidKeyToken(f))
+		c := 0
+		nSeq := 0
+		for _, r := range f {
+			if r == unPrintReplRune {
+				c++
+				if c == 1 {
+					nSeq++
+				}
+				require.LessOrEqual(t, c, unPrintMaxReplRune, "too many repeated %c", unPrintReplRune)
+			} else {
+				c = 0
+			}
+		}
+		require.Equalf(t, tests[i].nSeq, nSeq, "wrong number of elided sequences of replacement characters")
+	}
+}
 
 func TestShard_MapType(t *testing.T) {
 	var sh *TempShard
@@ -215,7 +246,7 @@ type TempShard struct {
 // NewTempShard returns a new instance of TempShard with temp paths.
 func NewTempShard(index string) *TempShard {
 	// Create temporary path for data and WAL.
-	dir, err := ioutil.TempDir("", "influxdb-tsdb-")
+	dir, err := os.MkdirTemp("", "influxdb-tsdb-")
 	if err != nil {
 		panic(err)
 	}

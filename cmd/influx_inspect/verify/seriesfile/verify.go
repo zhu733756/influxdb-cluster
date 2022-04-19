@@ -2,7 +2,6 @@ package seriesfile
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -48,7 +47,7 @@ func (v Verify) VerifySeriesFile(filePath string) (valid bool, err error) {
 		}
 	}()
 
-	partitionInfos, err := ioutil.ReadDir(filePath)
+	partitionInfos, err := os.ReadDir(filePath)
 	if os.IsNotExist(err) {
 		v.Logger.Error("Series file does not exist")
 		return false, nil
@@ -120,7 +119,7 @@ func (v Verify) VerifyPartition(partitionPath string) (valid bool, err error) {
 		}
 	}()
 
-	segmentInfos, err := ioutil.ReadDir(partitionPath)
+	segmentInfos, err := os.ReadDir(partitionPath)
 	if err != nil {
 		return false, err
 	}
@@ -185,7 +184,7 @@ func (v Verify) VerifySegment(segmentPath string, ids map[uint64]IDData) (valid 
 	v.Logger = v.Logger.With(zap.String("segment", segmentName))
 	v.Logger.Info("Verifying segment")
 
-	// Open up the segment and grab it's data.
+	// Open up the segment and grab its data.
 	segmentID, err := tsdb.ParseSeriesSegmentFilename(segmentName)
 	if err != nil {
 		return false, err
@@ -196,7 +195,8 @@ func (v Verify) VerifySegment(segmentPath string, ids map[uint64]IDData) (valid 
 		return false, nil
 	}
 	defer segment.Close()
-	buf := newBuffer(segment.Data())
+	// Only walk the file as it exists, not the whole mapping which may be bigger than the file.
+	buf := newBuffer(segment.Data()[:segment.Size()])
 
 	defer func() {
 		if rec := recover(); rec != nil {

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -212,12 +211,11 @@ func NewEngine(id uint64, idx tsdb.Index, path string, walPath string, sfile *ts
 		wal.syncDelay = time.Duration(opt.Config.WALFsyncDelay)
 	}
 
-	fs := NewFileStore(path)
+	fs := NewFileStore(path, WithMadviseWillNeed(opt.Config.TSMWillNeed))
 	fs.openLimiter = opt.OpenLimiter
 	if opt.FileStoreObserver != nil {
 		fs.WithObserver(opt.FileStoreObserver)
 	}
-	fs.tsmMMAPWillNeed = opt.Config.TSMWillNeed
 
 	cache := NewCache(uint64(opt.Config.CacheMaxMemorySize))
 
@@ -773,6 +771,7 @@ func (e *Engine) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.done = nil // Ensures that the channel will not be closed again.
+	e.fieldset.Close()
 
 	if err := e.FileStore.Close(); err != nil {
 		return err
@@ -1290,7 +1289,6 @@ func (e *Engine) addToIndexFromKey(keys [][]byte, fieldTypes []influxql.DataType
 //
 // TODO: We should consider obsolteing and removing this function in favor of
 // WritePointsWithContext()
-//
 func (e *Engine) WritePoints(points []models.Point) error {
 	return e.WritePointsWithContext(context.Background(), points)
 }
@@ -1304,7 +1302,6 @@ func (e *Engine) WritePoints(points []models.Point) error {
 //
 // It expects int64 pointers to be stored in the tsdb.StatPointsWritten and
 // tsdb.StatValuesWritten keys and will store the proper values if requested.
-//
 func (e *Engine) WritePointsWithContext(ctx context.Context, points []models.Point) error {
 	values := make(map[string][]Value, len(points))
 	var (
@@ -1668,6 +1665,9 @@ func (e *Engine) deleteSeriesRange(seriesKeys [][]byte, min, max int64) error {
 	// would delete it from the index.
 	minKey := seriesKeys[0]
 
+	// Ensure seriesKeys slice is correctly read and written concurrently in the Apply func.
+	var seriesKeysLock sync.RWMutex
+
 	// Apply runs this func concurrently.  The seriesKeys slice is mutated concurrently
 	// by different goroutines setting positions to nil.
 	if err := e.FileStore.Apply(func(r TSMFile) error {
@@ -1684,6 +1684,7 @@ func (e *Engine) deleteSeriesRange(seriesKeys [][]byte, min, max int64) error {
 			seriesKey, _ := SeriesAndFieldFromCompositeKey(indexKey)
 
 			// Skip over any deleted keys that are less than our tsm key
+			seriesKeysLock.RLock()
 			cmp := bytes.Compare(seriesKeys[j], seriesKey)
 			for j < len(seriesKeys) && cmp < 0 {
 				j++
@@ -1692,10 +1693,13 @@ func (e *Engine) deleteSeriesRange(seriesKeys [][]byte, min, max int64) error {
 				}
 				cmp = bytes.Compare(seriesKeys[j], seriesKey)
 			}
+			seriesKeysLock.RUnlock()
 
 			// We've found a matching key, cross it out so we do not remove it from the index.
 			if j < len(seriesKeys) && cmp == 0 {
+				seriesKeysLock.Lock()
 				seriesKeys[j] = emptyBytes
+				seriesKeysLock.Unlock()
 				j++
 			}
 		}
@@ -2417,7 +2421,7 @@ func (e *Engine) reloadCache() error {
 // cleanup removes all temp files and dirs that exist on disk.  This is should only be run at startup to avoid
 // removing tmp files that are still in use.
 func (e *Engine) cleanup() error {
-	allfiles, err := ioutil.ReadDir(e.path)
+	allfiles, err := os.ReadDir(e.path)
 	if os.IsNotExist(err) {
 		return nil
 	} else if err != nil {

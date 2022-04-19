@@ -151,10 +151,10 @@ func (f *LogFile) open() error {
 	for buf := f.data; len(buf) > 0; {
 		// Read next entry. Truncate partial writes.
 		var e LogEntry
-		if err := e.UnmarshalBinary(buf); err == io.ErrShortBuffer || err == ErrLogEntryChecksumMismatch {
+		if err := e.UnmarshalBinary(buf); errors.Is(err, io.ErrShortBuffer) || errors.Is(err, ErrLogEntryChecksumMismatch) {
 			break
 		} else if err != nil {
-			return err
+			return fmt.Errorf("%q: %w", f.path, err)
 		}
 
 		// Execute entry against in-memory index.
@@ -237,8 +237,8 @@ func (f *LogFile) Release() { f.wg.Done() }
 // Stat returns size and last modification time of the file.
 func (f *LogFile) Stat() (int64, time.Time) {
 	f.mu.RLock()
+	defer f.mu.RUnlock()
 	size, modTime := f.size, f.modTime
-	f.mu.RUnlock()
 	return size, modTime
 }
 
@@ -255,8 +255,8 @@ func (f *LogFile) TombstoneSeriesIDSet() (*tsdb.SeriesIDSet, error) {
 // Size returns the size of the file, in bytes.
 func (f *LogFile) Size() int64 {
 	f.mu.RLock()
+	defer f.mu.RUnlock()
 	v := f.size
-	f.mu.RUnlock()
 	return v
 }
 
@@ -704,6 +704,9 @@ func (f *LogFile) execSeriesEntry(e *LogEntry) {
 
 	// Read key size.
 	_, remainder := tsdb.ReadSeriesKeyLen(seriesKey)
+	if len(remainder) == 0 {
+		return
+	}
 
 	// Read measurement name.
 	name, remainder := tsdb.ReadSeriesKeyMeasurement(remainder)
@@ -1073,9 +1076,10 @@ func (f *LogFile) seriesSketches() (sketch, tSketch estimator.Sketch, err error)
 	return sketch, tSketch, nil
 }
 
-func (f *LogFile) ExecEntries(entries []LogEntry) error {
+func (f *LogFile) Writes(entries []LogEntry) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	for i := range entries {
 		entry := &entries[i]
 		if err := f.appendEntry(entry); err != nil {
@@ -1083,14 +1087,6 @@ func (f *LogFile) ExecEntries(entries []LogEntry) error {
 		}
 		f.execEntry(entry)
 	}
-	return nil
-}
-
-func (f *LogFile) Writes(entries []LogEntry) error {
-	if err := f.ExecEntries(entries); err != nil {
-		return err
-	}
-
 	// Flush buffer and sync to disk.
 	return f.FlushAndSync()
 }

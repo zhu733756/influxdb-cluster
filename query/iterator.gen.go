@@ -8,6 +8,7 @@ package query
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"io"
 	"sort"
 	"sync"
@@ -160,14 +161,15 @@ func (itr *floatMergeIterator) Close() error {
 	itr.mu.Lock()
 	defer itr.mu.Unlock()
 
+	var errs []error
 	for _, input := range itr.inputs {
-		input.Close()
+		errs = append(errs, input.Close())
 	}
 	itr.curr = nil
 	itr.inputs = nil
 	itr.heap.items = nil
 	itr.closed = true
-	return nil
+	return errors.Join(errs...)
 }
 
 // Next returns the next point from the iterator.
@@ -402,11 +404,10 @@ func (itr *floatSortedMergeIterator) pop() (*FloatPoint, error) {
 
 // floatSortedMergeHeap represents a heap of floatSortedMergeHeapItems.
 // Items are sorted with the following priority:
-//     - By their measurement name;
-//     - By their tag keys/values;
-//     - By time; or
-//     - By their Aux field values.
-//
+//   - By their measurement name;
+//   - By their tag keys/values;
+//   - By time; or
+//   - By their Aux field values.
 type floatSortedMergeHeap struct {
 	opt   IteratorOptions
 	items []*floatSortedMergeHeapItem
@@ -2824,14 +2825,15 @@ func (itr *integerMergeIterator) Close() error {
 	itr.mu.Lock()
 	defer itr.mu.Unlock()
 
+	var errs []error
 	for _, input := range itr.inputs {
-		input.Close()
+		errs = append(errs, input.Close())
 	}
 	itr.curr = nil
 	itr.inputs = nil
 	itr.heap.items = nil
 	itr.closed = true
-	return nil
+	return errors.Join(errs...)
 }
 
 // Next returns the next point from the iterator.
@@ -3066,11 +3068,10 @@ func (itr *integerSortedMergeIterator) pop() (*IntegerPoint, error) {
 
 // integerSortedMergeHeap represents a heap of integerSortedMergeHeapItems.
 // Items are sorted with the following priority:
-//     - By their measurement name;
-//     - By their tag keys/values;
-//     - By time; or
-//     - By their Aux field values.
-//
+//   - By their measurement name;
+//   - By their tag keys/values;
+//   - By time; or
+//   - By their Aux field values.
 type integerSortedMergeHeap struct {
 	opt   IteratorOptions
 	items []*integerSortedMergeHeapItem
@@ -5488,14 +5489,15 @@ func (itr *unsignedMergeIterator) Close() error {
 	itr.mu.Lock()
 	defer itr.mu.Unlock()
 
+	var errs []error
 	for _, input := range itr.inputs {
-		input.Close()
+		errs = append(errs, input.Close())
 	}
 	itr.curr = nil
 	itr.inputs = nil
 	itr.heap.items = nil
 	itr.closed = true
-	return nil
+	return errors.Join(errs...)
 }
 
 // Next returns the next point from the iterator.
@@ -5730,11 +5732,10 @@ func (itr *unsignedSortedMergeIterator) pop() (*UnsignedPoint, error) {
 
 // unsignedSortedMergeHeap represents a heap of unsignedSortedMergeHeapItems.
 // Items are sorted with the following priority:
-//     - By their measurement name;
-//     - By their tag keys/values;
-//     - By time; or
-//     - By their Aux field values.
-//
+//   - By their measurement name;
+//   - By their tag keys/values;
+//   - By time; or
+//   - By their Aux field values.
 type unsignedSortedMergeHeap struct {
 	opt   IteratorOptions
 	items []*unsignedSortedMergeHeapItem
@@ -8152,14 +8153,15 @@ func (itr *stringMergeIterator) Close() error {
 	itr.mu.Lock()
 	defer itr.mu.Unlock()
 
+	var errs []error
 	for _, input := range itr.inputs {
-		input.Close()
+		errs = append(errs, input.Close())
 	}
 	itr.curr = nil
 	itr.inputs = nil
 	itr.heap.items = nil
 	itr.closed = true
-	return nil
+	return errors.Join(errs...)
 }
 
 // Next returns the next point from the iterator.
@@ -8394,11 +8396,10 @@ func (itr *stringSortedMergeIterator) pop() (*StringPoint, error) {
 
 // stringSortedMergeHeap represents a heap of stringSortedMergeHeapItems.
 // Items are sorted with the following priority:
-//     - By their measurement name;
-//     - By their tag keys/values;
-//     - By time; or
-//     - By their Aux field values.
-//
+//   - By their measurement name;
+//   - By their tag keys/values;
+//   - By time; or
+//   - By their Aux field values.
 type stringSortedMergeHeap struct {
 	opt   IteratorOptions
 	items []*stringSortedMergeHeapItem
@@ -10802,14 +10803,15 @@ func (itr *booleanMergeIterator) Close() error {
 	itr.mu.Lock()
 	defer itr.mu.Unlock()
 
+	var errs []error
 	for _, input := range itr.inputs {
-		input.Close()
+		errs = append(errs, input.Close())
 	}
 	itr.curr = nil
 	itr.inputs = nil
 	itr.heap.items = nil
 	itr.closed = true
-	return nil
+	return errors.Join(errs...)
 }
 
 // Next returns the next point from the iterator.
@@ -11044,11 +11046,10 @@ func (itr *booleanSortedMergeIterator) pop() (*BooleanPoint, error) {
 
 // booleanSortedMergeHeap represents a heap of booleanSortedMergeHeapItems.
 // Items are sorted with the following priority:
-//     - By their measurement name;
-//     - By their tag keys/values;
-//     - By time; or
-//     - By their Aux field values.
-//
+//   - By their measurement name;
+//   - By their tag keys/values;
+//   - By time; or
+//   - By their Aux field values.
 type booleanSortedMergeHeap struct {
 	opt   IteratorOptions
 	items []*booleanSortedMergeHeapItem

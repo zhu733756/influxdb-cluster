@@ -3,7 +3,6 @@ package tsm1_test
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/influxdata/influxdb/logger"
 	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestFileStore_Read(t *testing.T) {
@@ -2376,6 +2376,43 @@ func TestFileStore_Open(t *testing.T) {
 	}
 }
 
+func TestFileStore_OpenFail(t *testing.T) {
+	var err error
+	dir := MustTempDir()
+	defer func() { assert.NoError(t, os.RemoveAll(dir), "failed to remove temporary directory") }()
+
+	// Create a TSM file...
+	data := keyValues{"cpu", []tsm1.Value{tsm1.NewValue(0, 1.0)}}
+
+	files, err := newFileDir(dir, data)
+	if err != nil {
+		fatal(t, "creating test files", err)
+	}
+	assert.Equal(t, 1, len(files))
+	f := files[0]
+
+	const mmapErrMsg = "mmap failure in test"
+	const fullMmapErrMsg = "system limit for vm.max_map_count may be too low: " + mmapErrMsg
+	// With an mmap failure, the files should all be left where they are, because they are not corrupt
+	openFail(t, dir, fullMmapErrMsg, tsm1.NewMmapError(fmt.Errorf(mmapErrMsg)))
+	assert.FileExistsf(t, f, "file not found, but should not have been moved for mmap failure")
+
+	// With a non-mmap failure, the file failing to open should be moved aside
+	const otherErrMsg = "some Random Init Failure"
+	openFail(t, dir, otherErrMsg, fmt.Errorf(otherErrMsg))
+	assert.NoFileExistsf(t, f, "file found, but should have been moved for open failure")
+	assert.FileExistsf(t, f+"."+tsm1.BadTSMFileExtension, "file not found, but should have been moved here for open failure")
+}
+
+func openFail(t *testing.T, dir string, fullErrMsg string, initErr error) {
+	fs := tsm1.NewFileStore(dir, tsm1.TestMmapInitFailOption(initErr))
+	err := fs.Open()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), fullErrMsg)
+	defer func() { assert.NoError(t, fs.Close(), "unexpected error on FileStore.Close") }()
+	assert.Equal(t, 0, fs.Count(), "file count mismatch")
+}
+
 func TestFileStore_Remove(t *testing.T) {
 	dir := MustTempDir()
 	defer os.RemoveAll(dir)
@@ -2725,7 +2762,7 @@ func TestFileStore_CreateSnapshot(t *testing.T) {
 	}
 	t.Logf("temp file for hard links: %q", s)
 
-	tfs, e := ioutil.ReadDir(s)
+	tfs, e := os.ReadDir(s)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -2927,7 +2964,7 @@ type keyValues struct {
 }
 
 func MustTempDir() string {
-	dir, err := ioutil.TempDir("", "tsm1-test")
+	dir, err := os.MkdirTemp("", "tsm1-test")
 	if err != nil {
 		panic(fmt.Sprintf("failed to create temp dir: %v", err))
 	}
@@ -2935,7 +2972,7 @@ func MustTempDir() string {
 }
 
 func MustTempFile(dir string) *os.File {
-	f, err := ioutil.TempFile(dir, "tsm1test")
+	f, err := os.CreateTemp(dir, "tsm1test")
 	if err != nil {
 		panic(fmt.Sprintf("failed to create temp file: %v", err))
 	}

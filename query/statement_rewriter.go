@@ -7,6 +7,8 @@ import (
 	"github.com/influxdata/influxql"
 )
 
+var matchAllRegex = regexp.MustCompile(`.+`)
+
 // RewriteStatement rewrites stmt into a new statement, if applicable.
 func RewriteStatement(stmt influxql.Statement) (influxql.Statement, error) {
 	switch stmt := stmt.(type) {
@@ -61,7 +63,7 @@ func rewriteShowFieldKeyCardinalityStatement(stmt *influxql.ShowFieldKeyCardinal
 	// Use all field keys, if zero.
 	if len(stmt.Sources) == 0 {
 		stmt.Sources = influxql.Sources{
-			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: regexp.MustCompile(`.+`)}},
+			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: matchAllRegex}},
 		}
 	}
 
@@ -123,7 +125,7 @@ func rewriteShowMeasurementCardinalityStatement(stmt *influxql.ShowMeasurementCa
 	// Use all measurements, if zero.
 	if len(stmt.Sources) == 0 {
 		stmt.Sources = influxql.Sources{
-			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: regexp.MustCompile(`.+`)}},
+			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: matchAllRegex}},
 		}
 	}
 
@@ -196,7 +198,7 @@ func rewriteShowSeriesCardinalityStatement(stmt *influxql.ShowSeriesCardinalityS
 	// Use all measurements, if zero.
 	if len(stmt.Sources) == 0 {
 		stmt.Sources = influxql.Sources{
-			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: regexp.MustCompile(`.+`)}},
+			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: matchAllRegex}},
 		}
 	}
 
@@ -222,9 +224,12 @@ func rewriteShowSeriesCardinalityStatement(stmt *influxql.ShowSeriesCardinalityS
 	}, nil
 }
 
-func rewriteShowTagValuesStatement(stmt *influxql.ShowTagValuesStatement) (influxql.Statement, error) {
+func withKeyExpr(tagKeyExpr influxql.Expr, op influxql.Token) influxql.Expr {
 	var expr influxql.Expr
-	if list, ok := stmt.TagKeyExpr.(*influxql.ListLiteral); ok {
+	if tagKeyExpr == nil {
+		return nil
+	}
+	if list, ok := tagKeyExpr.(*influxql.ListLiteral); ok {
 		for _, tagKey := range list.Vals {
 			tagExpr := &influxql.BinaryExpr{
 				Op:  influxql.EQ,
@@ -244,11 +249,17 @@ func rewriteShowTagValuesStatement(stmt *influxql.ShowTagValuesStatement) (influ
 		}
 	} else {
 		expr = &influxql.BinaryExpr{
-			Op:  stmt.Op,
+			Op:  op,
 			LHS: &influxql.VarRef{Val: "_tagKey"},
-			RHS: stmt.TagKeyExpr,
+			RHS: tagKeyExpr,
 		}
 	}
+	return expr
+}
+
+func rewriteShowTagValuesStatement(stmt *influxql.ShowTagValuesStatement) (influxql.Statement, error) {
+	// parser enforces that TagKeyExpr is non-nil
+	expr := withKeyExpr(stmt.TagKeyExpr, stmt.Op)
 
 	// Set condition or "AND" together.
 	condition := stmt.Condition
@@ -265,6 +276,7 @@ func rewriteShowTagValuesStatement(stmt *influxql.ShowTagValuesStatement) (influ
 
 	return &influxql.ShowTagValuesStatement{
 		Database:   stmt.Database,
+		Sources:    stmt.Sources,
 		Op:         stmt.Op,
 		TagKeyExpr: stmt.TagKeyExpr,
 		Condition:  condition,
@@ -278,7 +290,7 @@ func rewriteShowTagValuesCardinalityStatement(stmt *influxql.ShowTagValuesCardin
 	// Use all measurements, if zero.
 	if len(stmt.Sources) == 0 {
 		stmt.Sources = influxql.Sources{
-			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: regexp.MustCompile(`.+`)}},
+			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: matchAllRegex}},
 		}
 	}
 
@@ -346,9 +358,26 @@ func rewriteShowTagValuesCardinalityStatement(stmt *influxql.ShowTagValuesCardin
 }
 
 func rewriteShowTagKeysStatement(stmt *influxql.ShowTagKeysStatement) (influxql.Statement, error) {
+	condition := rewriteSourcesCondition(stmt.Sources, stmt.Condition)
+	tagExpr := withKeyExpr(stmt.TagKeyExpr, stmt.TagKeyOp)
+
+	// if tagExpr == nil, condition is already set correctly
+	if tagExpr != nil {
+		if condition != nil {
+			condition = &influxql.BinaryExpr{
+				LHS: &influxql.ParenExpr{Expr: condition},
+				RHS: &influxql.ParenExpr{Expr: tagExpr},
+				Op:  influxql.AND,
+			}
+		} else {
+			// condition is nil, replace with tagExpr
+			condition = tagExpr
+		}
+	}
+
 	return &influxql.ShowTagKeysStatement{
 		Database:   stmt.Database,
-		Condition:  rewriteSourcesCondition(stmt.Sources, stmt.Condition),
+		Condition:  condition,
 		SortFields: stmt.SortFields,
 		Limit:      stmt.Limit,
 		Offset:     stmt.Offset,
@@ -366,7 +395,7 @@ func rewriteShowTagKeyCardinalityStatement(stmt *influxql.ShowTagKeyCardinalityS
 	// Use all measurements, if zero.
 	if len(stmt.Sources) == 0 {
 		stmt.Sources = influxql.Sources{
-			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: regexp.MustCompile(`.+`)}},
+			&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: matchAllRegex}},
 		}
 	}
 
@@ -480,7 +509,7 @@ func rewriteSourcesCondition(sources influxql.Sources, cond influxql.Expr) influ
 
 func rewriteSources2(sources influxql.Sources, database string) influxql.Sources {
 	if len(sources) == 0 {
-		sources = influxql.Sources{&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: matchAllRegex.Copy()}}}
+		sources = influxql.Sources{&influxql.Measurement{Regex: &influxql.RegexLiteral{Val: matchAllRegex}}}
 	}
 	for _, source := range sources {
 		switch source := source.(type) {
@@ -492,5 +521,3 @@ func rewriteSources2(sources influxql.Sources, database string) influxql.Sources
 	}
 	return sources
 }
-
-var matchAllRegex = regexp.MustCompile(`.+`)

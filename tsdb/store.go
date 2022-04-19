@@ -6,13 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -73,6 +71,28 @@ func (d *databaseState) removeIndexType(indexType string) {
 // hasMultipleIndexTypes returns true if the database has multiple index types.
 func (d *databaseState) hasMultipleIndexTypes() bool { return d != nil && len(d.indexTypes) > 1 }
 
+type shardErrorMap struct {
+	mu          sync.Mutex
+	shardErrors map[uint64]error
+}
+
+func (se *shardErrorMap) setShardOpenError(shardID uint64, err error) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if err == nil {
+		delete(se.shardErrors, shardID)
+	} else {
+		se.shardErrors[shardID] = &ErrPreviousShardFail{error: fmt.Errorf("opening shard previously failed with: %w", err)}
+	}
+}
+
+func (se *shardErrorMap) shardError(shardID uint64) (error, bool) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	oldErr, hasErr := se.shardErrors[shardID]
+	return oldErr, hasErr
+}
+
 // Store manages shards and indexes for databases.
 type Store struct {
 	mu                sync.RWMutex
@@ -88,6 +108,9 @@ type Store struct {
 	// Maintains a set of shards that are in the process of deletion.
 	// This prevents new shards from being created while old ones are being deleted.
 	pendingShardDeletes map[uint64]struct{}
+
+	// Maintains a set of shards that failed to open
+	badShards shardErrorMap
 
 	// Epoch tracker helps serialize writes and deletes that may conflict. It
 	// is stored by shard.
@@ -113,6 +136,7 @@ func NewStore(path string) *Store {
 		sfiles:              make(map[string]*SeriesFile),
 		indexes:             make(map[string]interface{}),
 		pendingShardDeletes: make(map[uint64]struct{}),
+		badShards:           shardErrorMap{shardErrors: make(map[uint64]error)},
 		epochs:              make(map[uint64]*epochTracker),
 		EngineOptions:       NewEngineOptions(),
 		Logger:              logger,
@@ -294,7 +318,7 @@ func (s *Store) loadShards() error {
 	var n int
 
 	// Determine how many shards we need to open by checking the store path.
-	dbDirs, err := ioutil.ReadDir(s.path)
+	dbDirs, err := os.ReadDir(s.path)
 	if err != nil {
 		return err
 	}
@@ -324,7 +348,7 @@ func (s *Store) loadShards() error {
 		}
 
 		// Load each retention policy within the database directory.
-		rpDirs, err := ioutil.ReadDir(dbPath)
+		rpDirs, err := os.ReadDir(dbPath)
 		if err != nil {
 			return err
 		}
@@ -346,7 +370,7 @@ func (s *Store) loadShards() error {
 				continue
 			}
 
-			shardDirs, err := ioutil.ReadDir(rpPath)
+			shardDirs, err := os.ReadDir(rpPath)
 			if err != nil {
 				return err
 			}
@@ -401,9 +425,9 @@ func (s *Store) loadShards() error {
 					shard.CompactionDisabled = s.EngineOptions.CompactionDisabled
 					shard.WithLogger(s.baseLogger)
 
-					err = shard.Open()
+					err = s.OpenShard(shard, false)
 					if err != nil {
-						log.Info("Failed to open shard", logger.Shard(shardID), zap.Error(err))
+						log.Error("Failed to open shard", logger.Shard(shardID), zap.Error(err))
 						resC <- &res{err: fmt.Errorf("Failed to open shard: %d: %s", shardID, err)}
 						return
 					}
@@ -559,6 +583,42 @@ func (s *Store) Shard(id uint64) *Shard {
 	return sh
 }
 
+type ErrPreviousShardFail struct {
+	error
+}
+
+func (e ErrPreviousShardFail) Unwrap() error {
+	return e.error
+}
+
+func (e ErrPreviousShardFail) Is(err error) bool {
+	_, sOk := err.(ErrPreviousShardFail)
+	_, pOk := err.(*ErrPreviousShardFail)
+	return sOk || pOk
+}
+
+func (e ErrPreviousShardFail) Error() string {
+	return e.error.Error()
+}
+
+func (s *Store) OpenShard(sh *Shard, force bool) error {
+	if sh == nil {
+		return errors.New("cannot open nil shard")
+	}
+	oldErr, bad := s.badShards.shardError(sh.ID())
+	if force || !bad {
+		err := sh.Open()
+		s.badShards.setShardOpenError(sh.ID(), err)
+		return err
+	} else {
+		return oldErr
+	}
+}
+
+func (s *Store) SetShardOpenErrorForTest(shardID uint64, err error) {
+	s.badShards.setShardOpenError(shardID, err)
+}
+
 // Shards returns a list of shards by id.
 func (s *Store) Shards(ids []uint64) []*Shard {
 	s.mu.RLock()
@@ -652,7 +712,7 @@ func (s *Store) CreateShard(database, retentionPolicy string, shardID uint64, en
 	shard.WithLogger(s.baseLogger)
 	shard.EnableOnOpen = enabled
 
-	if err := shard.Open(); err != nil {
+	if err := s.OpenShard(shard, false); err != nil {
 		return err
 	}
 
@@ -698,10 +758,10 @@ func (s *Store) SetShardEnabled(shardID uint64, enabled bool) error {
 func (s *Store) DeleteShard(shardID uint64) error {
 	sh := s.Shard(shardID)
 	if sh == nil {
-		return nil
+		return ErrShardNotFound
 	}
 
-	// Remove the shard from Store so it's not returned to callers requesting
+	// Remove the shard from Store, so it's not returned to callers requesting
 	// shards. Also mark that this shard is currently being deleted in a separate
 	// map so that we do not have to retain the global store lock while deleting
 	// files.
@@ -730,7 +790,6 @@ func (s *Store) DeleteShard(shardID uint64) error {
 		defer s.mu.Unlock()
 		delete(s.epochs, shardID)
 		delete(s.pendingShardDeletes, shardID)
-		s.databases[db].removeIndexType(sh.IndexType())
 	}()
 
 	// Get the shard's local bitset of series IDs.
@@ -741,15 +800,22 @@ func (s *Store) DeleteShard(shardID uint64) error {
 
 	ss := index.SeriesIDSet()
 
-	s.walkShards(shards, func(sh *Shard) error {
+	err = s.walkShards(shards, func(sh *Shard) error {
 		index, err := sh.Index()
 		if err != nil {
+			s.Logger.Error("cannot find shard index", zap.Uint64("shard_id", sh.ID()), zap.Error(err))
 			return err
 		}
 
 		ss.Diff(index.SeriesIDSet())
 		return nil
 	})
+
+	if err != nil {
+		// We couldn't get the index for a shard. Rather than deleting series which may
+		// exist in that shard as well as in the current shard, we stop the current deletion
+		return err
+	}
 
 	// Remove any remaining series in the set from the series file, as they don't
 	// exist in any of the database's remaining shards.
@@ -762,7 +828,7 @@ func (s *Store) DeleteShard(shardID uint64) error {
 				var keyBuf []byte // Series key buffer.
 				var name []byte
 				var tagsBuf models.Tags // Buffer for tags container.
-				var err error
+				var errs []error
 
 				ss.ForEach(func(id uint64) {
 					skey := sfile.SeriesKey(id) // Series File series key
@@ -771,22 +837,32 @@ func (s *Store) DeleteShard(shardID uint64) error {
 					}
 
 					name, tagsBuf = ParseSeriesKeyInto(skey, tagsBuf)
+					keyBuf = keyBuf[:0]
 					keyBuf = models.AppendMakeKey(keyBuf, name, tagsBuf)
-					if err = index.DropSeriesGlobal(keyBuf); err != nil {
-						return
+					if tmpErr := index.DropSeriesGlobal(keyBuf); tmpErr != nil {
+						sfile.Logger.Error(
+							"cannot drop series",
+							zap.Uint64("series_id", id),
+							zap.String("key", string(keyBuf)),
+							zap.Error(tmpErr))
+						errs = append(errs, tmpErr)
 					}
 				})
-
-				if err != nil {
-					return err
+				if len(errs) != 0 {
+					return errors.Join(errs...)
 				}
 			}
 
 			ss.ForEach(func(id uint64) {
-				sfile.DeleteSeriesID(id)
+				if err := sfile.DeleteSeriesID(id); err != nil {
+					sfile.Logger.Error(
+						"cannot delete series in shard",
+						zap.Uint64("series_id", id),
+						zap.Uint64("shard_id", shardID),
+						zap.Error(err))
+				}
 			})
 		}
-
 	}
 
 	// enter the epoch tracker
@@ -806,9 +882,13 @@ func (s *Store) DeleteShard(shardID uint64) error {
 	// Remove the on-disk shard data.
 	if err := os.RemoveAll(sh.path); err != nil {
 		return err
+	} else if err = os.RemoveAll(sh.walPath); err != nil {
+		return err
+	} else {
+		// Remove index type from the database on success
+		s.databases[db].removeIndexType(sh.IndexType())
+		return nil
 	}
-
-	return os.RemoveAll(sh.walPath)
 }
 
 // DeleteDatabase will close all shards associated with a database and remove the directory and files from disk.
@@ -951,9 +1031,9 @@ func (s *Store) DeleteMeasurement(database, name string) error {
 	epochs := s.epochsForShards(shards)
 	s.mu.RUnlock()
 
-	// Limit to 1 delete for each shard since expanding the measurement into the list
+	// Limit deletes for each shard since expanding the measurement into the list
 	// of series keys can be very memory intensive if run concurrently.
-	limit := limiter.NewFixed(1)
+	limit := limiter.NewFixed(s.EngineOptions.Config.MaxConcurrentDeletes)
 	return s.walkShards(shards, func(sh *Shard) error {
 		limit.Take()
 		defer limit.Release()
@@ -1130,7 +1210,6 @@ func (s *Store) sketchesForDatabase(dbName string, getSketches func(*Shard) (est
 //
 // Cardinality is calculated exactly by unioning all shards' bitsets of series
 // IDs. The result of this method cannot be combined with any other results.
-//
 func (s *Store) SeriesCardinality(ctx context.Context, database string) (int64, error) {
 	s.mu.RLock()
 	shards := s.filterShards(byDatabase(database))
@@ -1200,7 +1279,11 @@ func (s *Store) MeasurementsCardinality(ctx context.Context, database string) (i
 	if err != nil {
 		return 0, err
 	}
-	return int64(ss.Count() - ts.Count()), nil
+	mc := int64(ss.Count() - ts.Count())
+	if mc < 0 {
+		mc = 0
+	}
+	return mc, nil
 }
 
 // MeasurementsSketches returns the sketches associated with the measurement
@@ -1342,9 +1425,9 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 	epochs := s.epochsForShards(shards)
 	s.mu.RUnlock()
 
-	// Limit to 1 delete for each shard since expanding the measurement into the list
+	// Limit deletes for each shard since expanding the measurement into the list
 	// of series keys can be very memory intensive if run concurrently.
-	limit := limiter.NewFixed(1)
+	limit := limiter.NewFixed(s.EngineOptions.Config.MaxConcurrentDeletes)
 
 	return s.walkShards(shards, func(sh *Shard) error {
 		// Determine list of measurements from sources.
@@ -1456,9 +1539,23 @@ func (s *Store) WriteToShardWithContext(ctx context.Context, shardID uint64, poi
 // MeasurementNames returns a slice of all measurements. Measurements accepts an
 // optional condition expression. If cond is nil, then all measurements for the
 // database will be returned.
-func (s *Store) MeasurementNames(ctx context.Context, auth query.FineAuthorizer, database string, cond influxql.Expr) ([][]byte, error) {
+// retentionPolicy is only valid for tsi databases, inmem will error.
+func (s *Store) MeasurementNames(ctx context.Context, auth query.FineAuthorizer, database string, retentionPolicy string, cond influxql.Expr) ([][]byte, error) {
+	var filterFunc func(sh *Shard) bool
+	if retentionPolicy == "" {
+		filterFunc = byDatabase(database)
+	} else {
+		// We don't support retention-policy level index checks on inmem since we only have a database-level index.
+		if s.EngineOptions.IndexVersion != TSI1IndexName {
+			return nil, fmt.Errorf("retention policy filter for measurements not supported for index %s", s.EngineOptions.IndexVersion)
+		}
+		filterFunc = func(sh *Shard) bool {
+			return sh.Database() == database && sh.RetentionPolicy() == retentionPolicy
+		}
+	}
+
 	s.mu.RLock()
-	shards := s.filterShards(byDatabase(database))
+	shards := s.filterShards(filterFunc)
 	s.mu.RUnlock()
 
 	sfile := s.seriesFile(database)
@@ -1508,35 +1605,32 @@ func (s *Store) TagKeys(ctx context.Context, auth query.FineAuthorizer, shardIDs
 		return nil, nil
 	}
 
-	measurementExpr := influxql.CloneExpr(cond)
-	measurementExpr = influxql.Reduce(influxql.RewriteExpr(measurementExpr, func(e influxql.Expr) influxql.Expr {
+	// take out the _name = 'mymeasurement' clause from 'FROM' clause
+	measurementExpr, remainingExpr, err := influxql.PartitionExpr(influxql.CloneExpr(cond), func(e influxql.Expr) (bool, error) {
 		switch e := e.(type) {
 		case *influxql.BinaryExpr:
 			switch e.Op {
 			case influxql.EQ, influxql.NEQ, influxql.EQREGEX, influxql.NEQREGEX:
 				tag, ok := e.LHS.(*influxql.VarRef)
-				if !ok || tag.Val != "_name" {
-					return nil
+				if ok && tag.Val == "_name" {
+					return true, nil
 				}
 			}
 		}
-		return e
-	}), nil)
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
 
-	filterExpr := influxql.CloneExpr(cond)
-	filterExpr = influxql.Reduce(influxql.RewriteExpr(filterExpr, func(e influxql.Expr) influxql.Expr {
-		switch e := e.(type) {
-		case *influxql.BinaryExpr:
-			switch e.Op {
-			case influxql.EQ, influxql.NEQ, influxql.EQREGEX, influxql.NEQREGEX:
-				tag, ok := e.LHS.(*influxql.VarRef)
-				if !ok || influxql.IsSystemName(tag.Val) {
-					return nil
-				}
-			}
-		}
-		return e
-	}), nil)
+	// take out the _tagKey = 'mykey' clause from 'WITH KEY' clause
+	tagKeyExpr, filterExpr, err := influxql.PartitionExpr(remainingExpr, isTagKeyClause)
+	if err != nil {
+		return nil, err
+	}
+	if err = isBadQuoteTagValueClause(filterExpr); err != nil {
+		return nil, err
+	}
 
 	// Get all the shards we're interested in.
 	is := IndexSet{Indexes: make([]Index, 0, len(shardIDs))}
@@ -1583,7 +1677,7 @@ func (s *Store) TagKeys(ctx context.Context, auth query.FineAuthorizer, shardIDs
 		default:
 		}
 		// Build keyset over all indexes for measurement.
-		tagKeySet, err := is.MeasurementTagKeysByExpr(name, nil)
+		tagKeySet, err := is.MeasurementTagKeysByExpr(name, tagKeyExpr)
 		if err != nil {
 			return nil, err
 		} else if len(tagKeySet) == 0 {
@@ -1679,43 +1773,94 @@ func (a tagValuesSlice) Len() int           { return len(a) }
 func (a tagValuesSlice) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a tagValuesSlice) Less(i, j int) bool { return bytes.Compare(a[i].name, a[j].name) == -1 }
 
+func isTagKeyClause(e influxql.Expr) (bool, error) {
+	switch e := e.(type) {
+	case *influxql.BinaryExpr:
+		switch e.Op {
+		case influxql.EQ, influxql.NEQ, influxql.EQREGEX, influxql.NEQREGEX:
+			tag, ok := e.LHS.(*influxql.VarRef)
+			if ok && tag.Val == "_tagKey" {
+				return true, nil
+			}
+		case influxql.OR, influxql.AND:
+			ok1, err := isTagKeyClause(e.LHS)
+			if err != nil {
+				return false, err
+			}
+			ok2, err := isTagKeyClause(e.RHS)
+			if err != nil {
+				return false, err
+			}
+			return ok1 && ok2, nil
+		}
+	case *influxql.ParenExpr:
+		return isTagKeyClause(e.Expr)
+	}
+	return false, nil
+}
+
+func isBadQuoteTagValueClause(e influxql.Expr) error {
+	switch e := e.(type) {
+	case *influxql.BinaryExpr:
+		switch e.Op {
+		case influxql.EQ, influxql.NEQ:
+			_, lOk := e.LHS.(*influxql.VarRef)
+			_, rOk := e.RHS.(*influxql.VarRef)
+			if lOk && rOk {
+				return fmt.Errorf("bad WHERE clause for metaquery; one term must be a string literal tag value within single quotes: %s", e.String())
+			}
+		case influxql.OR, influxql.AND:
+			if err := isBadQuoteTagValueClause(e.LHS); err != nil {
+				return err
+			} else if err = isBadQuoteTagValueClause(e.RHS); err != nil {
+				return err
+			} else {
+				return nil
+			}
+		}
+	case *influxql.ParenExpr:
+		return isBadQuoteTagValueClause(e.Expr)
+	}
+	return nil
+}
+
 // TagValues returns the tag keys and values for the provided shards, where the
 // tag values satisfy the provided condition.
 func (s *Store) TagValues(ctx context.Context, auth query.FineAuthorizer, shardIDs []uint64, cond influxql.Expr) ([]TagValues, error) {
+	if len(shardIDs) == 0 {
+		return nil, nil
+	}
+
 	if cond == nil {
 		return nil, errors.New("a condition is required")
 	}
 
-	measurementExpr := influxql.CloneExpr(cond)
-	measurementExpr = influxql.Reduce(influxql.RewriteExpr(measurementExpr, func(e influxql.Expr) influxql.Expr {
+	// take out the _name = 'mymeasurement' clause from 'FROM' clause
+	measurementExpr, remainingExpr, err := influxql.PartitionExpr(influxql.CloneExpr(cond), func(e influxql.Expr) (bool, error) {
 		switch e := e.(type) {
 		case *influxql.BinaryExpr:
 			switch e.Op {
 			case influxql.EQ, influxql.NEQ, influxql.EQREGEX, influxql.NEQREGEX:
 				tag, ok := e.LHS.(*influxql.VarRef)
-				if !ok || tag.Val != "_name" {
-					return nil
+				if ok && tag.Val == "_name" {
+					return true, nil
 				}
 			}
 		}
-		return e
-	}), nil)
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
 
-	filterExpr := influxql.CloneExpr(cond)
-	filterExpr = influxql.Reduce(influxql.RewriteExpr(filterExpr, func(e influxql.Expr) influxql.Expr {
-		switch e := e.(type) {
-		case *influxql.BinaryExpr:
-			switch e.Op {
-			case influxql.EQ, influxql.NEQ, influxql.EQREGEX, influxql.NEQREGEX:
-				tag, ok := e.LHS.(*influxql.VarRef)
-				if !ok || influxql.IsSystemName(tag.Val) {
-					return nil
-				}
-			}
-		}
-		return e
-	}), nil)
-
+	// take out the _tagKey = 'mykey' clause from 'WITH KEY' / 'WITH KEY IN' clause
+	tagKeyExpr, filterExpr, err := influxql.PartitionExpr(remainingExpr, isTagKeyClause)
+	if err != nil {
+		return nil, err
+	}
+	if err = isBadQuoteTagValueClause(filterExpr); err != nil {
+		return nil, err
+	}
 	// Build index set to work on.
 	is := IndexSet{Indexes: make([]Index, 0, len(shardIDs))}
 	s.mu.RLock()
@@ -1745,8 +1890,6 @@ func (s *Store) TagValues(ctx context.Context, auth query.FineAuthorizer, shardI
 	s.mu.RUnlock()
 	is = is.DedupeInmemIndexes()
 
-	// Stores each list of TagValues for each measurement.
-	var allResults []tagValues
 	var maxMeasurements int // Hint as to lower bound on number of measurements.
 	// names will be sorted by MeasurementNamesByExpr.
 	// Authorisation can be done later on, when series may have been filtered
@@ -1760,9 +1903,8 @@ func (s *Store) TagValues(ctx context.Context, auth query.FineAuthorizer, shardI
 		maxMeasurements = len(names)
 	}
 
-	if allResults == nil {
-		allResults = make([]tagValues, 0, len(is.Indexes)*len(names)) // Assuming all series in all shards.
-	}
+	// Stores each list of TagValues for each measurement.
+	allResults := make([]tagValues, 0, len(names))
 
 	// Iterate over each matching measurement in the shard. For each
 	// measurement we'll get the matching tag keys (e.g., when a WITH KEYS)
@@ -1778,7 +1920,7 @@ func (s *Store) TagValues(ctx context.Context, auth query.FineAuthorizer, shardI
 		}
 
 		// Determine a list of keys from condition.
-		keySet, err := is.MeasurementTagKeysByExpr(name, cond)
+		keySet, err := is.MeasurementTagKeysByExpr(name, tagKeyExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -1797,7 +1939,7 @@ func (s *Store) TagValues(ctx context.Context, auth query.FineAuthorizer, shardI
 		for k := range keySet {
 			result.keys = append(result.keys, k)
 		}
-		sort.Sort(sort.StringSlice(result.keys))
+		sort.Strings(result.keys)
 
 		// get all the tag values for each key in the keyset.
 		// Each slice in the results contains the sorted values associated
@@ -1826,19 +1968,11 @@ func (s *Store) TagValues(ctx context.Context, auth query.FineAuthorizer, shardI
 		}
 	}
 
+	// Not sure this is necessary, should be pre-sorted
+	sort.Sort(tagValuesSlice(allResults))
+
 	result := make([]TagValues, 0, maxMeasurements)
-
-	// We need to sort all results by measurement name.
-	if len(is.Indexes) > 1 {
-		sort.Sort(tagValuesSlice(allResults))
-	}
-
-	// The next stage is to merge the tagValue results for each shard's measurements.
-	var i, j int
-	// Used as a temporary buffer in mergeTagValues. There can be at most len(shards)
-	// instances of tagValues for a given measurement.
-	idxBuf := make([][2]int, 0, len(is.Indexes))
-	for i < len(allResults) {
+	for _, r := range allResults {
 		// check for timeouts
 		select {
 		case <-ctx.Done():
@@ -1846,20 +1980,7 @@ func (s *Store) TagValues(ctx context.Context, auth query.FineAuthorizer, shardI
 		default:
 		}
 
-		// Gather all occurrences of the same measurement for merging.
-		for j+1 < len(allResults) && bytes.Equal(allResults[j+1].name, allResults[i].name) {
-			j++
-		}
-
-		// An invariant is that there can't be more than n instances of tag
-		// key value pairs for a given measurement, where n is the number of
-		// shards.
-		if got, exp := j-i+1, len(is.Indexes); got > exp {
-			return nil, fmt.Errorf("unexpected results returned engine. Got %d measurement sets for %d shards", got, exp)
-		}
-
-		nextResult := mergeTagValues(idxBuf, allResults[i:j+1]...)
-		i = j + 1
+		nextResult := makeTagValues(r)
 		if len(nextResult.Values) > 0 {
 			result = append(result, nextResult)
 		}
@@ -1867,109 +1988,15 @@ func (s *Store) TagValues(ctx context.Context, auth query.FineAuthorizer, shardI
 	return result, nil
 }
 
-// mergeTagValues merges multiple sorted sets of temporary tagValues using a
-// direct k-way merge whilst also removing duplicated entries. The result is a
-// single TagValue type.
-//
-// TODO(edd): a Tournament based merge (see: Knuth's TAOCP 5.4.1) might be more
-// appropriate at some point.
-//
-func mergeTagValues(valueIdxs [][2]int, tvs ...tagValues) TagValues {
+func makeTagValues(tv tagValues) TagValues {
 	var result TagValues
-	if len(tvs) == 0 {
-		return TagValues{}
-	} else if len(tvs) == 1 {
-		result.Measurement = string(tvs[0].name)
-		// TODO(edd): will be too small likely. Find a hint?
-		result.Values = make([]KeyValue, 0, len(tvs[0].values))
+	result.Measurement = string(tv.name)
+	// TODO(edd): will be too small likely. Find a hint?
+	result.Values = make([]KeyValue, 0, len(tv.values))
 
-		for ki, key := range tvs[0].keys {
-			for _, value := range tvs[0].values[ki] {
-				result.Values = append(result.Values, KeyValue{Key: key, Value: value})
-			}
-		}
-		return result
-	}
-
-	result.Measurement = string(tvs[0].name)
-
-	var maxSize int
-	for _, tv := range tvs {
-		if len(tv.values) > maxSize {
-			maxSize = len(tv.values)
-		}
-	}
-	result.Values = make([]KeyValue, 0, maxSize) // This will likely be too small but it's a start.
-
-	// Resize and reset to the number of TagValues we're merging.
-	valueIdxs = valueIdxs[:len(tvs)]
-	for i := 0; i < len(valueIdxs); i++ {
-		valueIdxs[i][0], valueIdxs[i][1] = 0, 0
-	}
-
-	var (
-		j              int
-		keyCmp, valCmp int
-	)
-
-	for {
-		// Which of the provided TagValue sets currently holds the smallest element.
-		// j is the candidate we're going to next pick for the result set.
-		j = -1
-
-		// Find the smallest element
-		for i := 0; i < len(tvs); i++ {
-			if valueIdxs[i][0] >= len(tvs[i].keys) {
-				continue // We have completely drained all tag keys and values for this shard.
-			} else if len(tvs[i].values[valueIdxs[i][0]]) == 0 {
-				// There are no tag values for these keys.
-				valueIdxs[i][0]++
-				valueIdxs[i][1] = 0
-				continue
-			} else if j == -1 {
-				// We haven't picked a best TagValues set yet. Pick this one.
-				j = i
-				continue
-			}
-
-			// It this tag key is lower than the candidate's tag key
-			keyCmp = strings.Compare(tvs[i].keys[valueIdxs[i][0]], tvs[j].keys[valueIdxs[j][0]])
-			if keyCmp == -1 {
-				j = i
-			} else if keyCmp == 0 {
-				valCmp = strings.Compare(tvs[i].values[valueIdxs[i][0]][valueIdxs[i][1]], tvs[j].values[valueIdxs[j][0]][valueIdxs[j][1]])
-				// Same tag key but this tag value is lower than the candidate.
-				if valCmp == -1 {
-					j = i
-				} else if valCmp == 0 {
-					// Duplicate tag key/value pair.... Remove and move onto
-					// the next value for shard i.
-					valueIdxs[i][1]++
-					if valueIdxs[i][1] >= len(tvs[i].values[valueIdxs[i][0]]) {
-						// Drained all these tag values, move onto next key.
-						valueIdxs[i][0]++
-						valueIdxs[i][1] = 0
-					}
-				}
-			}
-		}
-
-		// We could have drained all of the TagValue sets and be done...
-		if j == -1 {
-			break
-		}
-
-		// Append the smallest KeyValue
-		result.Values = append(result.Values, KeyValue{
-			Key:   string(tvs[j].keys[valueIdxs[j][0]]),
-			Value: tvs[j].values[valueIdxs[j][0]][valueIdxs[j][1]],
-		})
-		// Increment the indexes for the chosen TagValue.
-		valueIdxs[j][1]++
-		if valueIdxs[j][1] >= len(tvs[j].values[valueIdxs[j][0]]) {
-			// Drained all these tag values, move onto next key.
-			valueIdxs[j][0]++
-			valueIdxs[j][1] = 0
+	for ki, key := range tv.keys {
+		for _, value := range tv.values[ki] {
+			result.Values = append(result.Values, KeyValue{Key: key, Value: value})
 		}
 	}
 	return result

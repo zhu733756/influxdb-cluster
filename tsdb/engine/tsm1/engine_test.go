@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"math/rand"
 	"os"
@@ -377,7 +376,7 @@ func TestEngine_Backup(t *testing.T) {
 	defer sfile.Close()
 
 	// Generate temporary file.
-	f, _ := ioutil.TempFile("", "tsm")
+	f, _ := os.CreateTemp("", "tsm")
 	f.Close()
 	os.Remove(f.Name())
 	walPath := filepath.Join(f.Name(), "wal")
@@ -497,7 +496,7 @@ func TestEngine_Backup(t *testing.T) {
 
 func TestEngine_Export(t *testing.T) {
 	// Generate temporary file.
-	f, _ := ioutil.TempFile("", "tsm")
+	f, _ := os.CreateTemp("", "tsm")
 	f.Close()
 	os.Remove(f.Name())
 	walPath := filepath.Join(f.Name(), "wal")
@@ -1139,7 +1138,7 @@ func TestIndex_SeriesIDSet(t *testing.T) {
 			}
 
 			name, tags := tsdb.ParseSeriesKey(engine.sfile.SeriesKey(e.SeriesID))
-			key := fmt.Sprintf("%s%s", name, tags.HashKey())
+			key := fmt.Sprintf("%s%s", name, tags.HashKey(true))
 			seriesIDMap[key] = e.SeriesID
 		}
 
@@ -1208,7 +1207,7 @@ func TestIndex_SeriesIDSet(t *testing.T) {
 }
 
 // Ensures that deleting series from TSM files with multiple fields removes all the
-/// series
+// series
 func TestEngine_DeleteSeries(t *testing.T) {
 	for _, index := range tsdb.RegisteredIndexes() {
 		t.Run(index, func(t *testing.T) {
@@ -1850,7 +1849,7 @@ func TestEngine_SnapshotsDisabled(t *testing.T) {
 	defer sfile.Close()
 
 	// Generate temporary file.
-	dir, _ := ioutil.TempDir("", "tsm")
+	dir, _ := os.MkdirTemp("", "tsm")
 	walPath := filepath.Join(dir, "wal")
 	os.MkdirAll(walPath, 0777)
 	defer os.RemoveAll(dir)
@@ -2572,7 +2571,7 @@ type Engine struct {
 
 // NewEngine returns a new instance of Engine at a temporary location.
 func NewEngine(index string) (*Engine, error) {
-	root, err := ioutil.TempDir("", "tsm1-")
+	root, err := os.MkdirTemp("", "tsm1-")
 	if err != nil {
 		panic(err)
 	}
@@ -2748,7 +2747,7 @@ type SeriesFile struct {
 
 // NewSeriesFile returns a new instance of SeriesFile with a temporary file path.
 func NewSeriesFile() *SeriesFile {
-	dir, err := ioutil.TempDir("", "tsdb-series-file-")
+	dir, err := os.MkdirTemp("", "tsdb-series-file-")
 	if err != nil {
 		panic(err)
 	}

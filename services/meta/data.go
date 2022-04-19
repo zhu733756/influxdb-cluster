@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -25,6 +26,10 @@ const (
 	// DefaultRetentionPolicyReplicaN is the default value of RetentionPolicyInfo.ReplicaN.
 	DefaultRetentionPolicyReplicaN = 1
 
+	// MaxAutoCreatedRetentionPolicyReplicaN is the maximum replication factor that will
+	// be set for auto-created retention policies.
+	MaxAutoCreatedRetentionPolicyReplicaN = 3
+
 	// DefaultRetentionPolicyDuration is the default value of RetentionPolicyInfo.Duration.
 	DefaultRetentionPolicyDuration = time.Duration(0)
 
@@ -44,6 +49,8 @@ type Data struct {
 	Term      uint64 // associated raft term
 	Index     uint64 // associated raft index
 	ClusterID uint64
+	MetaNodes []NodeInfo
+	DataNodes []NodeInfo
 	Databases []DatabaseInfo
 	Users     []UserInfo
 
@@ -51,8 +58,279 @@ type Data struct {
 	// if there is at least one admin user.
 	adminUserExists bool
 
+	MaxNodeID       uint64
 	MaxShardGroupID uint64
 	MaxShardID      uint64
+}
+
+// DataNode returns a node by id.
+func (data *Data) DataNode(id uint64) *NodeInfo {
+	for i := range data.DataNodes {
+		if data.DataNodes[i].ID == id {
+			return &data.DataNodes[i]
+		}
+	}
+	return nil
+}
+
+// CreateDataNode adds a node to the metadata.
+func (data *Data) CreateDataNode(addr, tcpAddr string) error {
+	// Ensure a node with the same host doesn't already exist.
+	for _, n := range data.DataNodes {
+		if n.TCPAddr == tcpAddr {
+			return ErrNodeExists
+		}
+	}
+
+	// If an existing meta node exists with the same TCPHost address,
+	// then these nodes are actually the same so re-use the existing ID
+	var existingID uint64
+	for _, n := range data.MetaNodes {
+		if n.TCPAddr == tcpAddr {
+			existingID = n.ID
+			break
+		}
+	}
+
+	// We didn't find an existing node, so assign it a new node ID
+	if existingID == 0 {
+		data.MaxNodeID++
+		existingID = data.MaxNodeID
+	}
+
+	// Append new node.
+	data.DataNodes = append(data.DataNodes, NodeInfo{
+		ID:      existingID,
+		Addr:    addr,
+		TCPAddr: tcpAddr,
+	})
+	sort.Sort(NodeInfos(data.DataNodes))
+
+	return nil
+}
+
+// setDataNode adds a data node with a pre-specified nodeID.
+// this should only be used when the cluster is upgrading from 0.9 to 0.10
+func (data *Data) setDataNode(nodeID uint64, addr, tcpAddr string) error {
+	// Ensure a node with the same host doesn't already exist.
+	for _, n := range data.DataNodes {
+		if n.Addr == addr {
+			return ErrNodeExists
+		}
+	}
+
+	// Append new node.
+	data.DataNodes = append(data.DataNodes, NodeInfo{
+		ID:      nodeID,
+		Addr:    addr,
+		TCPAddr: tcpAddr,
+	})
+
+	return nil
+}
+
+// DeleteDataNode removes a node from the Meta store.
+//
+// If necessary, DeleteDataNode reassigns ownership of any shards that
+// would otherwise become orphaned by the removal of the node from the
+// cluster.
+func (data *Data) DeleteDataNode(id uint64) error {
+	var nodes []NodeInfo
+
+	// Remove the data node from the store's list.
+	for _, n := range data.DataNodes {
+		if n.ID != id {
+			nodes = append(nodes, n)
+		}
+	}
+
+	if len(nodes) == len(data.DataNodes) {
+		return ErrNodeNotFound
+	}
+	data.DataNodes = nodes
+
+	// Remove node id from all shard infos
+	for di, d := range data.Databases {
+		for ri, rp := range d.RetentionPolicies {
+			for sgi, sg := range rp.ShardGroups {
+				var (
+					nodeOwnerFreqs = make(map[int]int)
+					orphanedShards []ShardInfo
+				)
+				// Look through all shards in the shard group and
+				// determine (1) if a shard no longer has any owners
+				// (orphaned); (2) if all shards in the shard group
+				// are orphaned; and (3) the number of shards in this
+				// group owned by each data node in the cluster.
+				for si, s := range sg.Shards {
+					// Track of how many shards in the group are
+					// owned by each data node in the cluster.
+					var nodeIdx = -1
+					for i, owner := range s.Owners {
+						if owner.NodeID == id {
+							nodeIdx = i
+						}
+						nodeOwnerFreqs[int(owner.NodeID)]++
+					}
+
+					if nodeIdx > -1 {
+						// Data node owns shard, so relinquish ownership
+						// and set new owners on the shard.
+						s.Owners = append(s.Owners[:nodeIdx], s.Owners[nodeIdx+1:]...)
+						data.Databases[di].RetentionPolicies[ri].ShardGroups[sgi].Shards[si].Owners = s.Owners
+					}
+
+					// Shard no longer owned. Will need reassigning
+					// an owner.
+					if len(s.Owners) == 0 {
+						orphanedShards = append(orphanedShards, s)
+					}
+				}
+
+				// Mark the shard group as deleted if it has no shards,
+				// or all of its shards are orphaned.
+				if len(sg.Shards) == 0 || len(orphanedShards) == len(sg.Shards) {
+					data.Databases[di].RetentionPolicies[ri].ShardGroups[sgi].DeletedAt = time.Now().UTC()
+					continue
+				}
+
+				// Reassign any orphaned shards. Delete the node we're
+				// dropping from the list of potential new owners.
+				delete(nodeOwnerFreqs, int(id))
+
+				for _, orphan := range orphanedShards {
+					newOwnerID, err := newShardOwner(orphan, nodeOwnerFreqs)
+					if err != nil {
+						return err
+					}
+
+					for si, s := range sg.Shards {
+						if s.ID == orphan.ID {
+							sg.Shards[si].Owners = append(sg.Shards[si].Owners, ShardOwner{NodeID: newOwnerID})
+							data.Databases[di].RetentionPolicies[ri].ShardGroups[sgi].Shards = sg.Shards
+							break
+						}
+					}
+
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// newShardOwner sets the owner of the provided shard to the data node
+// that currently owns the fewest number of shards. If multiple nodes
+// own the same (fewest) number of shards, then one of those nodes
+// becomes the new shard owner.
+func newShardOwner(s ShardInfo, ownerFreqs map[int]int) (uint64, error) {
+	var (
+		minId   = -1
+		minFreq int
+	)
+
+	for id, freq := range ownerFreqs {
+		if minId == -1 || freq < minFreq {
+			minId, minFreq = int(id), freq
+		}
+	}
+
+	if minId < 0 {
+		return 0, fmt.Errorf("cannot reassign shard %d due to lack of data nodes", s.ID)
+	}
+
+	// Update the shard owner frequencies and set the new owner on the
+	// shard.
+	ownerFreqs[minId]++
+	return uint64(minId), nil
+}
+
+// MetaNode returns a node by id.
+func (data *Data) MetaNode(id uint64) *NodeInfo {
+	for i := range data.MetaNodes {
+		if data.MetaNodes[i].ID == id {
+			return &data.MetaNodes[i]
+		}
+	}
+	return nil
+}
+
+// CreateMetaNode will add a new meta node to the metastore
+func (data *Data) CreateMetaNode(httpAddr, tcpAddr string) error {
+	// Ensure a node with the same host doesn't already exist.
+	for _, n := range data.MetaNodes {
+		if n.Addr == httpAddr {
+			return ErrNodeExists
+		}
+	}
+
+	// If an existing data node exists with the same TCPHost address,
+	// then these nodes are actually the same so re-use the existing ID
+	var existingID uint64
+	for _, n := range data.DataNodes {
+		if n.TCPAddr == tcpAddr {
+			existingID = n.ID
+			break
+		}
+	}
+
+	// We didn't find and existing data node ID, so assign a new ID
+	// to this meta node.
+	if existingID == 0 {
+		data.MaxNodeID++
+		existingID = data.MaxNodeID
+	}
+
+	// Append new node.
+	data.MetaNodes = append(data.MetaNodes, NodeInfo{
+		ID:      existingID,
+		Addr:    httpAddr,
+		TCPAddr: tcpAddr,
+	})
+
+	sort.Sort(NodeInfos(data.MetaNodes))
+	return nil
+}
+
+// SetMetaNode will update the information for the single meta
+// node or create a new metanode. If there are more than 1 meta
+// nodes already, an error will be returned
+func (data *Data) SetMetaNode(httpAddr, tcpAddr string) error {
+	if len(data.MetaNodes) > 1 {
+		return fmt.Errorf("can't set meta node when there are more than 1 in the metastore")
+	}
+
+	if len(data.MetaNodes) == 0 {
+		return data.CreateMetaNode(httpAddr, tcpAddr)
+	}
+
+	data.MetaNodes[0].Addr = httpAddr
+	data.MetaNodes[0].TCPAddr = tcpAddr
+
+	return nil
+}
+
+// DeleteMetaNode will remove the meta node from the store
+func (data *Data) DeleteMetaNode(id uint64) error {
+	// Node has to be larger than 0 to be real
+	if id == 0 {
+		return ErrNodeIDRequired
+	}
+
+	var nodes []NodeInfo
+	for _, n := range data.MetaNodes {
+		if n.ID == id {
+			continue
+		}
+		nodes = append(nodes, n)
+	}
+
+	if len(nodes) == len(data.MetaNodes) {
+		return ErrNodeNotFound
+	}
+
+	data.MetaNodes = nodes
+	return nil
 }
 
 // Database returns a DatabaseInfo by the database name.
@@ -302,6 +580,95 @@ func (data *Data) DropShard(id uint64) {
 	}
 }
 
+// CopyShardOwner copies a shard owner by ID and NodeID.
+func (data *Data) CopyShardOwner(id, nodeID uint64) {
+	found := -1
+	for dbidx, dbi := range data.Databases {
+		for rpidx, rpi := range dbi.RetentionPolicies {
+			for sgidx, sg := range rpi.ShardGroups {
+				for sidx, s := range sg.Shards {
+					if s.ID == id {
+						found = sidx
+						break
+					}
+				}
+
+				if found > -1 {
+					nodeIdx := -1
+					s := sg.Shards[found]
+					for i, owner := range s.Owners {
+						if owner.NodeID == nodeID {
+							return
+						}
+						if owner.NodeID > nodeID && nodeIdx == -1 {
+							nodeIdx = i
+						}
+					}
+
+					if nodeIdx > -1 {
+						s.Owners = append(s.Owners[:nodeIdx+1], s.Owners[nodeIdx:]...)
+						s.Owners[nodeIdx] = ShardOwner{NodeID: nodeID}
+
+					} else {
+						s.Owners = append(s.Owners, ShardOwner{NodeID: nodeID})
+					}
+
+					data.Databases[dbidx].RetentionPolicies[rpidx].ShardGroups[sgidx].Shards[found].Owners = s.Owners
+					return
+				}
+			}
+		}
+	}
+}
+
+// RemoveShardOwner removes a shard owner by ID and NodeID.
+func (data *Data) RemoveShardOwner(id, nodeID uint64) {
+	found := -1
+	for dbidx, dbi := range data.Databases {
+		for rpidx, rpi := range dbi.RetentionPolicies {
+			for sgidx, sg := range rpi.ShardGroups {
+				for sidx, s := range sg.Shards {
+					if s.ID == id {
+						found = sidx
+						break
+					}
+				}
+
+				if found > -1 {
+					nodeIdx := -1
+					s := sg.Shards[found]
+					for i, owner := range s.Owners {
+						if owner.NodeID == nodeID {
+							nodeIdx = i
+							break
+						}
+					}
+
+					if nodeIdx > -1 {
+						// Data node owns shard, so relinquish ownership
+						// and set new owners on the shard.
+						s.Owners = append(s.Owners[:nodeIdx], s.Owners[nodeIdx+1:]...)
+						data.Databases[dbidx].RetentionPolicies[rpidx].ShardGroups[sgidx].Shards[found].Owners = s.Owners
+					}
+
+					// Shard no longer owned. Will need removing the shard.
+					if len(s.Owners) == 0 {
+						shards := sg.Shards
+						data.Databases[dbidx].RetentionPolicies[rpidx].ShardGroups[sgidx].Shards = append(shards[:found], shards[found+1:]...)
+
+						if len(shards) == 1 {
+							// We just deleted the last shard in the shard group.
+							data.Databases[dbidx].RetentionPolicies[rpidx].ShardGroups[sgidx].DeletedAt = time.Now()
+						}
+					}
+
+					return
+				}
+			}
+		}
+	}
+}
+
 // ShardGroups returns a list of all shard groups on a database and retention policy.
 func (data *Data) ShardGroups(database, policy string) ([]ShardGroupInfo, error) {
 	// Find retention policy.
@@ -356,6 +723,11 @@ func (data *Data) ShardGroupByTimestamp(database, policy string, timestamp time.
 
 // CreateShardGroup creates a shard group on a database and policy for a given timestamp.
 func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time) error {
+	// Ensure there are nodes in the metadata.
+	if len(data.DataNodes) == 0 {
+		return nil
+	}
+
 	// Find retention policy.
 	rpi, err := data.RetentionPolicy(database, policy)
 	if err != nil {
@@ -369,20 +741,83 @@ func (data *Data) CreateShardGroup(database, policy string, timestamp time.Time)
 		return nil
 	}
 
+	// Require at least one replica but no more replicas than nodes.
+	replicaN := rpi.ReplicaN
+	if replicaN == 0 {
+		replicaN = 1
+	} else if replicaN > len(data.DataNodes) {
+		replicaN = len(data.DataNodes)
+	}
+
+	// Determine shard count by the least common multiple of node count and
+	// replication factor divided by node count.
+	// This will ensure nodes will get distributed across nodes evenly and
+	// replicated the correct number of times.
+	shardN := 1
+	for shardN*replicaN%len(data.DataNodes) != 0 {
+		shardN++
+	}
+
+	startTime := timestamp.Truncate(rpi.ShardGroupDuration).UTC()
+	endTime := startTime.Add(rpi.ShardGroupDuration).UTC()
+	if endTime.After(time.Unix(0, models.MaxNanoTime)) {
+		// Shard group range is [start, end) so add one to the max time.
+		endTime = time.Unix(0, models.MaxNanoTime+1)
+	}
+
+	for i := range rpi.ShardGroups {
+		if rpi.ShardGroups[i].Deleted() {
+			continue
+		}
+		startI := rpi.ShardGroups[i].StartTime
+		endI := rpi.ShardGroups[i].EndTime
+		if rpi.ShardGroups[i].Truncated() {
+			endI = rpi.ShardGroups[i].TruncatedAt
+		}
+
+		// shard_i covers range [start_i, end_i)
+		// We want the largest range [startTime, endTime) such that all of the following hold:
+		//   startTime <= timestamp < endTime
+		//   for all i, not { start_i < endTime && startTime < end_i }
+		// Assume the above conditions are true for shards index < i, we want to modify startTime,endTime so they are true
+		// also for shard_i
+
+		// It must be the case that either endI <= timestamp || timestamp < startI, because otherwise:
+		// startI <= timestamp < endI means timestamp is contained in shard I
+		if !timestamp.Before(endI) && endI.After(startTime) {
+			// startTime < endI <= timestamp
+			startTime = endI
+		}
+		if startI.After(timestamp) && startI.Before(endTime) {
+			// timestamp < startI < endTime
+			endTime = startI
+		}
+	}
+
 	// Create the shard group.
 	data.MaxShardGroupID++
 	sgi := ShardGroupInfo{}
 	sgi.ID = data.MaxShardGroupID
-	sgi.StartTime = timestamp.Truncate(rpi.ShardGroupDuration).UTC()
-	sgi.EndTime = sgi.StartTime.Add(rpi.ShardGroupDuration).UTC()
-	if sgi.EndTime.After(time.Unix(0, models.MaxNanoTime)) {
-		// Shard group range is [start, end) so add one to the max time.
-		sgi.EndTime = time.Unix(0, models.MaxNanoTime+1)
+	sgi.StartTime = startTime
+	sgi.EndTime = endTime
+
+	// Create shards on the group.
+	sgi.Shards = make([]ShardInfo, shardN)
+	for i := range sgi.Shards {
+		data.MaxShardID++
+		sgi.Shards[i] = ShardInfo{ID: data.MaxShardID}
 	}
 
-	data.MaxShardID++
-	sgi.Shards = []ShardInfo{
-		{ID: data.MaxShardID},
+	// Assign data nodes to shards via round robin.
+	// Start from a repeatably "random" place in the node list.
+	nodeIndex := int(data.Index % uint64(len(data.DataNodes)))
+	for i := range sgi.Shards {
+		si := &sgi.Shards[i]
+		for j := 0; j < replicaN; j++ {
+			nodeID := data.DataNodes[nodeIndex%len(data.DataNodes)].ID
+			si.Owners = append(si.Owners, ShardOwner{NodeID: nodeID})
+			nodeIndex++
+		}
 	}
 
 	// Retention policy has a new shard group, so update the policy. Shard
@@ -689,18 +1124,26 @@ func (data *Data) Clone() *Data {
 	return &other
 }
 
-// marshal serializes data to a protobuf representation.
+// marshal serializes to a protobuf representation.
 func (data *Data) marshal() *internal.Data {
 	pb := &internal.Data{
 		Term:      proto.Uint64(data.Term),
 		Index:     proto.Uint64(data.Index),
 		ClusterID: proto.Uint64(data.ClusterID),
 
+		MaxNodeID:       proto.Uint64(data.MaxNodeID),
 		MaxShardGroupID: proto.Uint64(data.MaxShardGroupID),
 		MaxShardID:      proto.Uint64(data.MaxShardID),
+	}
 
-		// Need this for reverse compatibility
-		MaxNodeID: proto.Uint64(0),
+	pb.DataNodes = make([]*internal.NodeInfo, len(data.DataNodes))
+	for i := range data.DataNodes {
+		pb.DataNodes[i] = data.DataNodes[i].marshal()
+	}
+
+	pb.MetaNodes = make([]*internal.NodeInfo, len(data.MetaNodes))
+	for i := range data.MetaNodes {
+		pb.MetaNodes[i] = data.MetaNodes[i].marshal()
 	}
 
 	pb.Databases = make([]*internal.DatabaseInfo, len(data.Databases))
@@ -722,8 +1165,27 @@ func (data *Data) unmarshal(pb *internal.Data) {
 	data.Index = pb.GetIndex()
 	data.ClusterID = pb.GetClusterID()
 
+	data.MaxNodeID = pb.GetMaxNodeID()
 	data.MaxShardGroupID = pb.GetMaxShardGroupID()
 	data.MaxShardID = pb.GetMaxShardID()
+
+	// TODO: Nodes is deprecated. This is being left here to make migration from 0.9.x to 0.10.0 possible
+	if len(pb.GetNodes()) > 0 {
+		data.DataNodes = make([]NodeInfo, len(pb.GetNodes()))
+		for i, x := range pb.GetNodes() {
+			data.DataNodes[i].unmarshal(x)
+		}
+	} else {
+		data.DataNodes = make([]NodeInfo, len(pb.GetDataNodes()))
+		for i, x := range pb.GetDataNodes() {
+			data.DataNodes[i].unmarshal(x)
+		}
+	}
+
+	data.MetaNodes = make([]NodeInfo, len(pb.GetMetaNodes()))
+	for i, x := range pb.GetMetaNodes() {
+		data.MetaNodes[i].unmarshal(x)
+	}
 
 	data.Databases = make([]DatabaseInfo, len(pb.GetDatabases()))
 	for i, x := range pb.GetDatabases() {
@@ -777,6 +1239,28 @@ func (data *Data) TruncateShardGroups(t time.Time) {
 					sgi.TruncatedAt = t
 				}
 			}
+		}
+	}
+}
+
+// PruneShardGroups remove deleted shard groups from the data store.
+func (data *Data) PruneShardGroups() {
+	expiration := time.Now().Add(ShardGroupDeletedExpiration)
+	for i, d := range data.Databases {
+		for j, rp := range d.RetentionPolicies {
+			var changed bool
+			var remainingShardGroups []ShardGroupInfo
+			for _, sgi := range rp.ShardGroups {
+				if sgi.DeletedAt.IsZero() || !expiration.After(sgi.DeletedAt) {
+					remainingShardGroups = append(remainingShardGroups, sgi)
+					continue
+				}
+				changed = true
+			}
+			if !changed {
+				continue
+			}
+			data.Databases[i].RetentionPolicies[j].ShardGroups = remainingShardGroups
 		}
 	}
 }
@@ -895,8 +1379,27 @@ func (data *Data) importOneDB(other Data, backupDBName, restoreDBName, backupRPN
 // NodeInfo represents information about a single node in the cluster.
 type NodeInfo struct {
 	ID      uint64
-	Host    string
-	TCPHost string
+	Addr    string
+	TCPAddr string
+}
+
+// clone returns a deep copy of ni.
+func (ni NodeInfo) clone() NodeInfo { return ni }
+
+// marshal serializes to a protobuf representation.
+func (ni NodeInfo) marshal() *internal.NodeInfo {
+	pb := &internal.NodeInfo{}
+	pb.ID = proto.Uint64(ni.ID)
+	pb.Addr = proto.String(ni.Addr)
+	pb.TCPAddr = proto.String(ni.TCPAddr)
+	return pb
+}
+
+// unmarshal deserializes from a protobuf representation.
+func (ni *NodeInfo) unmarshal(pb *internal.NodeInfo) {
+	ni.ID = pb.GetID()
+	ni.Addr = pb.GetAddr()
+	ni.TCPAddr = pb.GetTCPAddr()
 }
 
 // NodeInfos is a slice of NodeInfo used for sorting
@@ -1755,4 +2258,143 @@ func ValidName(name string) bool {
 		name != "." &&
 		name != ".." &&
 		!strings.ContainsAny(name, `/\`)
+}
+
+const (
+	NodeTypeData = "data"
+	NodeTypeMeta = "meta"
+)
+
+const (
+	NodeStatusJoined    = "joined"
+	NodeStatusDisjoined = "disjoined"
+)
+
+type Announcements map[string]*Announcement
+
+func (a *Announcements) MarshalBinary() ([]byte, error) {
+	return json.Marshal(a)
+}
+
+func (a *Announcements) UnmarshalBinary(buf []byte) error {
+	return json.Unmarshal(buf, a)
+}
+
+type Announcement struct {
+	TCPAddr    string    `json:"tcpAddr"`
+	HTTPAddr   string    `json:"httpAddr"`
+	HTTPScheme string    `json:"httpScheme"`
+	Time       time.Time `json:"time"`
+	NodeType   string    `json:"nodeType"`
+	Status     string    `json:"status"`
+	Context    Context   `json:"context"`
+	Version    string    `json:"version"`
+}
+
+type Context map[string]json.RawMessage
+
+type DataNodeStatus struct {
+	NodeType   string   `json:"nodeType"`
+	Hostname   string   `json:"hostname"`
+	TCPBind    string   `json:"tcpBind"`
+	TCPAddr    string   `json:"tcpAddr"`
+	HTTPAddr   string   `json:"httpAddr"`
+	NodeStatus string   `json:"nodeStatus"`
+	MetaAddrs  []string `json:"metaAddrs"`
+}
+
+type MetaNodeStatus struct {
+	NodeType string   `json:"nodeType"`
+	Leader   string   `json:"leader"`
+	HTTPAddr string   `json:"httpAddr"`
+	RaftAddr string   `json:"raftAddr"`
+	Peers    []string `json:"peers"`
+}
+
+type DataNodeInfo struct {
+	ID         uint64 `json:"id"`
+	TCPAddr    string `json:"tcpAddr"`
+	HTTPAddr   string `json:"httpAddr"`
+	HTTPScheme string `json:"httpScheme"`
+	Status     string `json:"status"`
+	Version    string `json:"version"`
+}
+
+func NewDataNodeInfo(n *NodeInfo) *DataNodeInfo {
+	return &DataNodeInfo{
+		ID:       n.ID,
+		TCPAddr:  n.TCPAddr,
+		HTTPAddr: n.Addr,
+	}
+}
+
+type MetaNodeInfo struct {
+	ID         uint64 `json:"id"`
+	Addr       string `json:"addr"`
+	HTTPScheme string `json:"httpScheme"`
+	TCPAddr    string `json:"tcpAddr"`
+	Version    string `json:"version"`
+}
+
+func NewMetaNodeInfo(n *NodeInfo) *MetaNodeInfo {
+	return &MetaNodeInfo{
+		ID:      n.ID,
+		Addr:    n.Addr,
+		TCPAddr: n.TCPAddr,
+	}
+}
+
+type ClusterInfo struct {
+	Data []*DataNodeInfo `json:"data"`
+	Meta []*MetaNodeInfo `json:"meta"`
+}
+
+type ClusterShardInfo struct {
+	ID              uint64            `json:"id"`
+	Database        string            `json:"database"`
+	RetentionPolicy string            `json:"retention-policy"`
+	ReplicaN        int               `json:"replica-n"`
+	ShardGroupID    uint64            `json:"shard-group-id"`
+	StartTime       time.Time         `json:"start-time"`
+	EndTime         time.Time         `json:"end-time"`
+	ExpireTime      time.Time         `json:"expire-time"`
+	TruncatedAt     time.Time         `json:"truncated-at"`
+	Owners          []*ShardOwnerInfo `json:"owners"`
+}
+
+type ShardOwnerInfo struct {
+	ID           uint64    `json:"id"`
+	TCPAddr      string    `json:"tcpAddr"`
+	State        string    `json:"state"`
+	LastModified time.Time `json:"last-modified"`
+	Size         int64     `json:"size"`
+	Err          string    `json:"err"`
+}
+
+type UserPrivilege struct {
+	Name     string `json:"name"`
+	Hash     string `json:"hash,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+type UserPrivileges struct {
+	Users []*UserPrivilege `json:"users,omitempty"`
+}
+
+type UserOperation struct {
+	Action string         `json:"action"`
+	User   *UserPrivilege `json:"user"`
+}
+
+type RolePrivilege struct {
+	Name string `json:"name"`
+}
+
+type RolePrivileges struct {
+	Roles []*RolePrivilege `json:"roles,omitempty"`
+}
+
+type RoleOperation struct {
+	Action string         `json:"action"`
+	Role   *RolePrivilege `json:"role"`
 }

@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -339,7 +339,7 @@ func TestClient_BasicAuth(t *testing.T) {
 
 func TestClient_Write(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		in, err := ioutil.ReadAll(r.Body)
+		in, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		} else if have, want := strings.TrimSpace(string(in)), `m0,host=server01 v1=2,v2=2i,v3=2u,v4="foobar",v5=true 0`; have != want {
@@ -747,7 +747,9 @@ func TestClient_Timeout(t *testing.T) {
 	if err == nil {
 		t.Fatalf("unexpected success. expected timeout error")
 	} else if !strings.Contains(err.Error(), "request canceled") &&
-		!strings.Contains(err.Error(), "use of closed network connection") {
+		!strings.Contains(err.Error(), "context deadline exceeded") &&
+		!strings.Contains(err.Error(), "use of closed network connection") &&
+		!strings.Contains(err.Error(), "Client.Timeout exceeded") {
 		t.Fatalf("unexpected error. expected 'request canceled' error, got %v", err)
 	}
 }
@@ -942,7 +944,7 @@ war3JNM1mGB3o2iAtuOJlFIKLpI1x+1e8pI=
 	server.StartTLS()
 	defer server.Close()
 
-	certFile, _ := ioutil.TempFile("", "influx-cert-")
+	certFile, _ := os.CreateTemp("", "influx-cert-")
 	certFile.WriteString(cert)
 	certFile.Close()
 	defer os.Remove(certFile.Name())

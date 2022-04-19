@@ -2,6 +2,7 @@ package models_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -32,7 +33,7 @@ var (
 )
 
 func TestMarshal(t *testing.T) {
-	got := tags.HashKey()
+	got := tags.HashKey(true)
 	if exp := ",apple=orange,foo=bar,host=serverA,region=uswest"; string(got) != exp {
 		t.Log("got: ", string(got))
 		t.Log("exp: ", exp)
@@ -83,7 +84,7 @@ func TestMarshalFields(t *testing.T) {
 
 func TestTags_HashKey(t *testing.T) {
 	tags = models.NewTags(map[string]string{"A FOO": "bar", "APPLE": "orange", "host": "serverA", "region": "uswest"})
-	got := tags.HashKey()
+	got := tags.HashKey(true)
 	if exp := ",A\\ FOO=bar,APPLE=orange,host=serverA,region=uswest"; string(got) != exp {
 		t.Log("got: ", string(got))
 		t.Log("exp: ", exp)
@@ -93,7 +94,7 @@ func TestTags_HashKey(t *testing.T) {
 
 func BenchmarkMarshal(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		tags.HashKey()
+		tags.HashKey(true)
 	}
 }
 func TestPoint_Tags(t *testing.T) {
@@ -2228,7 +2229,7 @@ func TestNewPointsWithBytesWithCorruptData(t *testing.T) {
 
 func TestNewPointsWithShortBuffer(t *testing.T) {
 	_, err := models.NewPointFromBytes([]byte{0, 0, 0, 3, 4})
-	if err != io.ErrShortBuffer {
+	if !errors.Is(err, io.ErrShortBuffer) {
 		t.Fatalf("NewPointFromBytes: got: (%v, %v), expected: (nil, error)", p, err)
 	}
 }
@@ -2525,7 +2526,7 @@ func BenchmarkTags_HashKey(b *testing.B) {
 		b.Run(bm.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				bm.t.HashKey()
+				bm.t.HashKey(true)
 			}
 		})
 	}

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,6 +16,7 @@ import (
 	"github.com/influxdata/influxdb/logger"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/pkg/bytesutil"
+	errors2 "github.com/influxdata/influxdb/pkg/errors"
 	"github.com/influxdata/influxdb/pkg/estimator"
 	"github.com/influxdata/influxdb/tsdb"
 	"github.com/influxdata/influxql"
@@ -89,11 +89,11 @@ type Partition struct {
 // NewPartition returns a new instance of Partition.
 func NewPartition(sfile *tsdb.SeriesFile, path string) *Partition {
 	return &Partition{
-		closing:     make(chan struct{}),
-		path:        path,
-		sfile:       sfile,
-		seriesIDSet: tsdb.NewSeriesIDSet(),
-
+		closing:        make(chan struct{}),
+		path:           path,
+		sfile:          sfile,
+		seriesIDSet:    tsdb.NewSeriesIDSet(),
+		fileSet:        &FileSet{},
 		MaxLogFileSize: tsdb.DefaultMaxIndexLogFileSize,
 
 		// compactionEnabled: true,
@@ -142,21 +142,21 @@ func (p *Partition) bytes() int {
 var ErrIncompatibleVersion = errors.New("incompatible tsi1 index MANIFEST")
 
 // Open opens the partition.
-func (p *Partition) Open() error {
+func (p *Partition) Open() (rErr error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.closing = make(chan struct{})
 
 	if p.opened {
-		return errors.New("index partition already open")
+		return fmt.Errorf("index partition already open: %q", p.path)
 	}
 
 	// Validate path is correct.
 	p.id = filepath.Base(p.path)
 	_, err := strconv.Atoi(p.id)
 	if err != nil {
-		return err
+		return fmt.Errorf("poorly formed manifest file path, %q: %w", p.path, err)
 	}
 
 	// Create directory if it doesn't exist.
@@ -164,8 +164,9 @@ func (p *Partition) Open() error {
 		return err
 	}
 
+	filename := filepath.Join(p.path, ManifestFileName)
 	// Read manifest file.
-	m, manifestSize, err := ReadManifestFile(filepath.Join(p.path, ManifestFileName))
+	m, manifestSize, err := ReadManifestFile(filename)
 	if os.IsNotExist(err) {
 		m = NewManifest(p.ManifestPath())
 	} else if err != nil {
@@ -188,6 +189,12 @@ func (p *Partition) Open() error {
 
 	// Open each file in the manifest.
 	var files []File
+	defer func() {
+		if rErr != nil {
+			Files(files).Close()
+		}
+	}()
+
 	for _, filename := range m.Files {
 		switch filepath.Ext(filename) {
 		case LogFileExt:
@@ -232,7 +239,7 @@ func (p *Partition) Open() error {
 		}
 	}
 
-	// Build series existance set.
+	// Build series existence set.
 	if err := p.buildSeriesSet(); err != nil {
 		return err
 	}
@@ -244,6 +251,10 @@ func (p *Partition) Open() error {
 	p.compact()
 
 	return nil
+}
+
+func (p *Partition) IsOpen() bool {
+	return p.opened
 }
 
 // openLogFile opens a log file and appends it to the index.
@@ -269,12 +280,12 @@ func (p *Partition) openIndexFile(path string) (*IndexFile, error) {
 }
 
 // deleteNonManifestFiles removes all files not in the manifest.
-func (p *Partition) deleteNonManifestFiles(m *Manifest) error {
+func (p *Partition) deleteNonManifestFiles(m *Manifest) (rErr error) {
 	dir, err := os.Open(p.path)
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer errors2.Capture(&rErr, dir.Close)()
 
 	fis, err := dir.Readdir(-1)
 	if err != nil {
@@ -293,7 +304,7 @@ func (p *Partition) deleteNonManifestFiles(m *Manifest) error {
 		}
 	}
 
-	return dir.Close()
+	return nil
 }
 
 func (p *Partition) buildSeriesSet() error {
@@ -458,7 +469,11 @@ func (p *Partition) retainFileSet() *FileSet {
 }
 
 // FileN returns the active files in the file set.
-func (p *Partition) FileN() int { return len(p.fileSet.files) }
+func (p *Partition) FileN() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.fileSet.files)
+}
 
 // prependActiveLogFile adds a new log file so that the current log file can be compacted.
 func (p *Partition) prependActiveLogFile() error {
@@ -1007,6 +1022,11 @@ func (p *Partition) compactToLevel(files []*IndexFile, level int, interrupt <-ch
 		return
 	}
 
+	if err = f.Sync(); err != nil {
+		log.Error("Error sync index file", zap.Error(err))
+		return
+	}
+
 	// Close file.
 	if err := f.Close(); err != nil {
 		log.Error("Error closing index file", zap.Error(err))
@@ -1152,9 +1172,14 @@ func (p *Partition) compactLogFile(logFile *LogFile) {
 		return
 	}
 
+	if err = f.Sync(); err != nil {
+		log.Error("Cannot sync index file", zap.Error(err))
+		return
+	}
+
 	// Close file.
 	if err := f.Close(); err != nil {
-		log.Error("Cannot close log file", zap.Error(err))
+		log.Error("Cannot close index file", zap.Error(err))
 		return
 	}
 
@@ -1286,7 +1311,7 @@ func (m *Manifest) Validate() error {
 	// If we don't have an explicit version in the manifest file then we know
 	// it's not compatible with the latest tsi1 Index.
 	if m.Version != Version {
-		return ErrIncompatibleVersion
+		return fmt.Errorf("%q: %w", m.path, ErrIncompatibleVersion)
 	}
 	return nil
 }
@@ -1296,20 +1321,46 @@ func (m *Manifest) Validate() error {
 func (m *Manifest) Write() (int64, error) {
 	buf, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed marshaling %q: %w", m.path, err)
 	}
 	buf = append(buf, '\n')
 
-	if err := ioutil.WriteFile(m.path, buf, 0666); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(m.path), ManifestFileName)
+
+	if err != nil {
 		return 0, err
 	}
+
+	tmp := f.Name()
+	// In correct operation, Remove() should fail because the file was renamed
+	defer os.Remove(tmp)
+	err = func() (rErr error) {
+		// Close() before rename for Windows
+		defer errors2.Capture(&rErr, f.Close)()
+		if _, err = f.Write(buf); err != nil {
+			return fmt.Errorf("failed writing temporary manifest file %q: %w", tmp, err)
+		}
+		return nil
+	}()
+	if err != nil {
+		return 0, err
+	}
+
+	if err = os.Chmod(tmp, 0666); err != nil {
+		return 0, err
+	}
+
+	if err = os.Rename(tmp, m.path); err != nil {
+		return 0, err
+	}
+
 	return int64(len(buf)), nil
 }
 
 // ReadManifestFile reads a manifest from a file path and returns the Manifest,
 // the size of the manifest on disk, and any error if appropriate.
 func ReadManifestFile(path string) (*Manifest, int64, error) {
-	buf, err := ioutil.ReadFile(path)
+	buf, err := os.ReadFile(path)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1317,7 +1368,7 @@ func ReadManifestFile(path string) (*Manifest, int64, error) {
 	// Decode manifest.
 	var m Manifest
 	if err := json.Unmarshal(buf, &m); err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("failed unmarshaling %q: %w", path, err)
 	}
 
 	// Set the path of the manifest.

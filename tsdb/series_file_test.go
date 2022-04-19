@@ -3,7 +3,6 @@ package tsdb_test
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"testing"
@@ -48,6 +47,57 @@ func TestParseSeriesKeyInto(t *testing.T) {
 		t.Fatalf("got tags length %d, expected %d", got, exp)
 	} else if got, exp := gotTags, tags; !got.Equal(exp) {
 		t.Fatalf("got tags %v, expected %v", got, exp)
+	}
+}
+
+func TestParseSeriesKey(t *testing.T) {
+	tests := []struct {
+		name        string
+		seriesKey   []byte
+		expectedKey []byte
+	}{
+		{
+			name:        "invalid zero length series key",
+			seriesKey:   tsdb.AppendSeriesKey(nil, []byte{}, nil),
+			expectedKey: nil,
+		},
+		{
+			name:        "invalid blank series key",
+			seriesKey:   tsdb.AppendSeriesKey(nil, []byte(""), nil),
+			expectedKey: nil,
+		},
+		{
+			name:        "invalid series key with tags",
+			seriesKey:   tsdb.AppendSeriesKey(nil, []byte{}, models.NewTags(map[string]string{"tag1": "foo"})),
+			expectedKey: nil,
+		},
+		{
+			name:        "valid series key with tags",
+			seriesKey:   tsdb.AppendSeriesKey(nil, []byte("foo"), models.NewTags(map[string]string{"tag1": "foo"})),
+			expectedKey: []byte("foo"),
+		},
+		{
+			name:        "valid series key with empty tags",
+			seriesKey:   tsdb.AppendSeriesKey(nil, []byte("foo"), models.NewTags(map[string]string{})),
+			expectedKey: []byte("foo"),
+		},
+		{
+			name:        "valid series key with nil tags",
+			seriesKey:   tsdb.AppendSeriesKey(nil, []byte("foo"), models.NewTags(nil)),
+			expectedKey: []byte("foo"),
+		},
+		{
+			name:        "valid series key with no tags",
+			seriesKey:   tsdb.AppendSeriesKey(nil, []byte("foo"), nil),
+			expectedKey: []byte("foo"),
+		},
+	}
+
+	for _, tt := range tests {
+		keyName, _ := tsdb.ParseSeriesKey(tt.seriesKey)
+		if res := bytes.Compare(keyName, tt.expectedKey); res != 0 {
+			t.Fatalf("invalid series key parsed for an %s: got %q, expected %q", tt.name, keyName, tt.expectedKey)
+		}
 	}
 }
 
@@ -317,7 +367,7 @@ type SeriesFile struct {
 
 // NewSeriesFile returns a new instance of SeriesFile with a temporary file path.
 func NewSeriesFile() *SeriesFile {
-	dir, err := ioutil.TempDir("", "tsdb-series-file-")
+	dir, err := os.MkdirTemp("", "tsdb-series-file-")
 	if err != nil {
 		panic(err)
 	}
@@ -334,7 +384,7 @@ func NewBrokenSeriesFile(content []byte) *SeriesFile {
 	if _, err := os.Stat(segPath); os.IsNotExist(err) {
 		panic(err)
 	}
-	err := ioutil.WriteFile(segPath, content, 0777)
+	err := os.WriteFile(segPath, content, 0777)
 	if err != nil {
 		panic(err)
 	}

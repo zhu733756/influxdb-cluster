@@ -56,9 +56,10 @@ type Service struct {
 	ready bool          // Has the required database been created?
 	done  chan struct{} // Is the service closing or closed?
 
-	BindAddress     string
-	Database        string
-	RetentionPolicy string
+	BindAddress      string
+	Database         string
+	RetentionPolicy  string
+	ConsistencyLevel models.ConsistencyLevel
 
 	PointsWriter interface {
 		WritePointsPrivileged(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
@@ -82,23 +83,29 @@ type Service struct {
 
 // NewService returns a new instance of Service.
 func NewService(c Config) (*Service, error) {
+	consistencyLevel, err := models.ParseConsistencyLevel(c.ConsistencyLevel)
+	if err != nil {
+		return nil, err
+	}
+
 	// Use defaults where necessary.
 	d := c.WithDefaults()
 
 	s := &Service{
-		tls:             d.TLSEnabled,
-		tlsConfig:       d.TLS,
-		cert:            d.Certificate,
-		BindAddress:     d.BindAddress,
-		Database:        d.Database,
-		RetentionPolicy: d.RetentionPolicy,
-		batchSize:       d.BatchSize,
-		batchPending:    d.BatchPending,
-		batchTimeout:    time.Duration(d.BatchTimeout),
-		Logger:          zap.NewNop(),
-		LogPointErrors:  d.LogPointErrors,
-		stats:           &Statistics{},
-		defaultTags:     models.StatisticTags{"bind": d.BindAddress},
+		tls:              d.TLSEnabled,
+		tlsConfig:        d.TLS,
+		cert:             d.Certificate,
+		BindAddress:      d.BindAddress,
+		Database:         d.Database,
+		RetentionPolicy:  d.RetentionPolicy,
+		ConsistencyLevel: consistencyLevel,
+		batchSize:        d.BatchSize,
+		batchPending:     d.BatchPending,
+		batchTimeout:     time.Duration(d.BatchTimeout),
+		Logger:           zap.NewNop(),
+		LogPointErrors:   d.LogPointErrors,
+		stats:            &Statistics{},
+		defaultTags:      models.StatisticTags{"bind": d.BindAddress},
 	}
 	if s.tlsConfig == nil {
 		s.tlsConfig = new(tls.Config)
@@ -346,7 +353,8 @@ func (s *Service) handleConn(conn net.Conn) {
 
 // handleTelnetConn accepts OpenTSDB's telnet protocol.
 // Each telnet command consists of a line of the form:
-//   put sys.cpu.user 1356998400 42.5 host=webserver01 cpu=0
+//
+//	put sys.cpu.user 1356998400 42.5 host=webserver01 cpu=0
 func (s *Service) handleTelnetConn(conn net.Conn) {
 	defer conn.Close()
 	defer atomic.AddInt64(&s.stats.ActiveTelnetConnections, -1)
@@ -453,11 +461,12 @@ func (s *Service) handleTelnetConn(conn net.Conn) {
 // serveHTTP handles connections in HTTP format.
 func (s *Service) serveHTTP() {
 	handler := &Handler{
-		Database:        s.Database,
-		RetentionPolicy: s.RetentionPolicy,
-		PointsWriter:    s.PointsWriter,
-		Logger:          s.Logger,
-		stats:           s.stats,
+		Database:         s.Database,
+		RetentionPolicy:  s.RetentionPolicy,
+		ConsistencyLevel: s.ConsistencyLevel,
+		PointsWriter:     s.PointsWriter,
+		Logger:           s.Logger,
+		stats:            s.stats,
 	}
 	srv := &http.Server{Handler: handler}
 	srv.Serve(s.httpln)
@@ -476,7 +485,7 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 				continue
 			}
 
-			if err := s.PointsWriter.WritePointsPrivileged(s.Database, s.RetentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
+			if err := s.PointsWriter.WritePointsPrivileged(s.Database, s.RetentionPolicy, s.ConsistencyLevel, batch); err == nil {
 				atomic.AddInt64(&s.stats.BatchesTransmitted, 1)
 				atomic.AddInt64(&s.stats.PointsTransmitted, int64(len(batch)))
 			} else {

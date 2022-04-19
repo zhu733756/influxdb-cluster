@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"reflect"
@@ -23,6 +22,8 @@ import (
 )
 
 var data = meta.Data{
+	MetaNodes: []meta.NodeInfo{},
+	DataNodes: []meta.NodeInfo{},
 	Databases: []meta.DatabaseInfo{
 		{
 			Name: "db0",
@@ -145,7 +146,7 @@ func TestSnapshotter_RequestShardBackup(t *testing.T) {
 	}
 
 	// Read the result.
-	out, err := ioutil.ReadAll(conn)
+	out, err := io.ReadAll(conn)
 	if err != nil {
 		t.Errorf("unexpected error reading shard backup: %s", err)
 		return
@@ -243,7 +244,7 @@ func TestSnapshotter_RequestDatabaseInfo(t *testing.T) {
 	}
 
 	// Read the result.
-	out, err := ioutil.ReadAll(conn)
+	out, err := io.ReadAll(conn)
 	if err != nil {
 		t.Errorf("unexpected error reading database info: %s", err)
 		return
@@ -297,7 +298,7 @@ func TestSnapshotter_RequestDatabaseInfo_ErrDatabaseNotFound(t *testing.T) {
 	}
 
 	// Read the result.
-	out, err := ioutil.ReadAll(conn)
+	out, err := io.ReadAll(conn)
 	if err != nil {
 		t.Errorf("unexpected error reading database info: %s", err)
 		return
@@ -362,7 +363,7 @@ func TestSnapshotter_RequestRetentionPolicyInfo(t *testing.T) {
 	}
 
 	// Read the result.
-	out, err := ioutil.ReadAll(conn)
+	out, err := io.ReadAll(conn)
 	if err != nil {
 		t.Errorf("unexpected error reading database info: %s", err)
 		return
@@ -439,7 +440,7 @@ func TestSnapshotter_InvalidRequest(t *testing.T) {
 	conn.Write([]byte(`["invalid request"]`))
 
 	// Read the result.
-	out, err := ioutil.ReadAll(conn)
+	out, err := io.ReadAll(conn)
 	if err != nil {
 		t.Errorf("unexpected error reading database info: %s", err)
 		return

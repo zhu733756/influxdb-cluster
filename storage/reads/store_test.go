@@ -87,6 +87,10 @@ func cursorToString(wr io.Writer, cur cursors.Cursor) {
 
 const nilVal = "<nil>"
 
+var (
+	nilValBytes = []byte(nilVal)
+)
+
 func joinString(b [][]byte) string {
 	s := make([]string, len(b))
 	for i := range b {
@@ -101,7 +105,7 @@ func joinString(b [][]byte) string {
 }
 
 func tagsToString(wr io.Writer, tags models.Tags, opts ...optionFn) {
-	if k := tags.HashKey(); len(k) > 0 {
+	if k := tags.HashKey(true); len(k) > 0 {
 		fmt.Fprintf(wr, "%s", string(k[1:]))
 	}
 	fmt.Fprintln(wr)

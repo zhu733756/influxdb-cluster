@@ -3,7 +3,7 @@ package tsdb_test
 import (
 	"compress/gzip"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -421,12 +421,12 @@ func MustNewIndex(index string, eopts ...EngineOption) *Index {
 		opt(&opts)
 	}
 
-	rootPath, err := ioutil.TempDir("", "influxdb-tsdb")
+	rootPath, err := os.MkdirTemp("", "influxdb-tsdb")
 	if err != nil {
 		panic(err)
 	}
 
-	seriesPath, err := ioutil.TempDir(rootPath, tsdb.SeriesFileDirectory)
+	seriesPath, err := os.MkdirTemp(rootPath, tsdb.SeriesFileDirectory)
 	if err != nil {
 		panic(err)
 	}
@@ -479,7 +479,7 @@ func (idx *Index) IndexSet() *tsdb.IndexSet {
 
 func (idx *Index) AddSeries(name string, tags map[string]string) error {
 	t := models.NewTags(tags)
-	key := fmt.Sprintf("%s,%s", name, t.HashKey())
+	key := fmt.Sprintf("%s,%s", name, t.HashKey(true))
 	return idx.CreateSeriesIfNotExists([]byte(key), []byte(name), t)
 }
 
@@ -556,7 +556,7 @@ func BenchmarkIndexSet_TagSets(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	data, err := ioutil.ReadAll(gzr)
+	data, err := io.ReadAll(gzr)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -646,7 +646,7 @@ func BenchmarkIndexSet_TagSets(b *testing.B) {
 // This benchmark concurrently writes series to the index and fetches cached bitsets.
 // The idea is to emphasize the performance difference when bitset caching is on and off.
 //
-// Typical results for an i7 laptop
+// # Typical results for an i7 laptop
 //
 // BenchmarkIndex_ConcurrentWriteQuery/inmem/queries_100000/cache-8   	  1	5963346204 ns/op	2499655768 B/op	 23964183 allocs/op
 // BenchmarkIndex_ConcurrentWriteQuery/inmem/queries_100000/no_cache-8    1	5314841090 ns/op	2499495280 B/op	 23963322 allocs/op
@@ -674,7 +674,7 @@ func BenchmarkIndex_ConcurrentWriteQuery(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	data, err := ioutil.ReadAll(gzr)
+	data, err := io.ReadAll(gzr)
 	if err != nil {
 		b.Fatal(err)
 	}

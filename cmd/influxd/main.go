@@ -8,13 +8,12 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
 	"github.com/influxdata/influxdb/cmd"
-	"github.com/influxdata/influxdb/cmd/influxd/backup"
 	"github.com/influxdata/influxdb/cmd/influxd/help"
-	"github.com/influxdata/influxdb/cmd/influxd/restore"
 	"github.com/influxdata/influxdb/cmd/influxd/run"
 )
 
@@ -39,7 +38,7 @@ func init() {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	m := NewMain()
 	if err := m.Run(os.Args[1:]...); err != nil {
@@ -87,8 +86,11 @@ func (m *Main) Run(args ...string) error {
 		cmd.Logger.Info("Listening for signals")
 
 		// Block until one of the signals above is received
-		<-signalCh
+		sig := <-signalCh
 		cmd.Logger.Info("Signal received, initializing clean shutdown...")
+		if sig == syscall.SIGTERM && cmd.Server.LogQueriesOnTermination() {
+			cmd.Server.QueryExecutor.TaskManager.LogCurrentQueries(cmd.Logger.Info)
+		}
 		go cmd.Close()
 
 		// Block again until another signal is received, a shutdown timeout elapses,
@@ -105,16 +107,6 @@ func (m *Main) Run(args ...string) error {
 
 		// goodbye.
 
-	case "backup":
-		name := backup.NewCommand()
-		if err := name.Run(args...); err != nil {
-			return fmt.Errorf("backup: %s", err)
-		}
-	case "restore":
-		name := restore.NewCommand()
-		if err := name.Run(args...); err != nil {
-			return fmt.Errorf("restore: %s", err)
-		}
 	case "config":
 		if err := run.NewPrintConfigCommand().Run(args...); err != nil {
 			return fmt.Errorf("config: %s", err)
@@ -158,7 +150,8 @@ func (cmd *VersionCommand) Run(args ...string) error {
 	}
 
 	// Print version info.
-	fmt.Fprintf(cmd.Stdout, "InfluxDB v%s (git: %s %s)\n", version, branch, commit)
+	fmt.Fprintf(cmd.Stdout, "InfluxDB v%s (git: %s %s, build: %s %s/%s)\n", version, branch, commit,
+		runtime.Version(), runtime.GOOS, runtime.GOARCH)
 
 	return nil
 }

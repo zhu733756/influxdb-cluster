@@ -6,17 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unsafe"
 
 	"github.com/gogo/protobuf/proto"
@@ -206,13 +205,18 @@ func (s *Shard) WithLogger(log *zap.Logger) {
 // writes and queries return an error and compactions are stopped for the shard.
 func (s *Shard) SetEnabled(enabled bool) {
 	s.mu.Lock()
+	s.setEnabledNoLock(enabled)
+	s.mu.Unlock()
+}
+
+// setEnabledNoLock performs actual work of SetEnabled. Must hold s.mu before calling.
+func (s *Shard) setEnabledNoLock(enabled bool) {
 	// Prevent writes and queries
 	s.enabled = enabled
 	if s._engine != nil && !s.CompactionDisabled {
 		// Disable background compactions and snapshotting
 		s._engine.SetEnabled(enabled)
 	}
-	s.mu.Unlock()
 }
 
 // ScheduleFullCompaction forces a full compaction to be schedule on the shard.
@@ -302,10 +306,14 @@ func (s *Shard) Path() string { return s.path }
 
 // Open initializes and opens the shard's store.
 func (s *Shard) Open() error {
-	if err := func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openNoLock()
+}
 
+// openNoLock does work of Open. Must hold s.mu before calling.
+func (s *Shard) openNoLock() error {
+	if err := func() error {
 		// Return if the shard is already open
 		if s._engine != nil {
 			return nil
@@ -353,13 +361,13 @@ func (s *Shard) Open() error {
 
 		return nil
 	}(); err != nil {
-		s.close()
+		s.closeNoLock()
 		return NewShardError(s.id, err)
 	}
 
 	if s.EnableOnOpen {
 		// enable writes, queries and compactions
-		s.SetEnabled(true)
+		s.setEnabledNoLock(true)
 	}
 
 	return nil
@@ -369,12 +377,12 @@ func (s *Shard) Open() error {
 func (s *Shard) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.close()
+	return s.closeNoLock()
 }
 
-// close closes the shard an removes reference to the shard from associated
+// closeNoLock closes the shard an removes reference to the shard from associated
 // indexes, unless clean is false.
-func (s *Shard) close() error {
+func (s *Shard) closeNoLock() error {
 	if s._engine == nil {
 		return nil
 	}
@@ -515,7 +523,6 @@ const (
 // will store points written stats into the int64 pointer associated with
 // StatPointsWritten and the number of values written in the int64 pointer
 // stored in the StatValuesWritten context values.
-//
 func (s *Shard) WritePointsWithContext(ctx context.Context, points []models.Point) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -622,7 +629,7 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]models.Point, 
 		if validateKeys && !models.ValidKeyTokens(string(p.Name()), tags) {
 			dropped++
 			if reason == "" {
-				reason = fmt.Sprintf("key contains invalid unicode: \"%s\"", string(p.Key()))
+				reason = fmt.Sprintf("key contains invalid unicode: %q", makePrintable(string(p.Key())))
 			}
 			continue
 		}
@@ -741,6 +748,28 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]models.Point, 
 	return points[:j], fieldsToCreate, err
 }
 
+const unPrintReplRune = '?'
+const unPrintMaxReplRune = 3
+
+// makePrintable - replace invalid and non-printable unicode characters with a few '?' runes
+func makePrintable(s string) string {
+	b := strings.Builder{}
+	b.Grow(len(s))
+	c := 0
+	for _, r := range strings.ToValidUTF8(s, string(unicode.ReplacementChar)) {
+		if !unicode.IsPrint(r) || r == unicode.ReplacementChar {
+			if c < unPrintMaxReplRune {
+				b.WriteRune(unPrintReplRune)
+			}
+			c++
+		} else {
+			b.WriteRune(r)
+			c = 0
+		}
+	}
+	return b.String()
+}
+
 func (s *Shard) createFieldsAndMeasurements(fieldsToCreate []*FieldCreate) error {
 	if len(fieldsToCreate) == 0 {
 		return nil
@@ -826,26 +855,6 @@ func (s *Shard) MeasurementNamesByRegex(re *regexp.Regexp) ([][]byte, error) {
 		return nil, err
 	}
 	return engine.MeasurementNamesByRegex(re)
-}
-
-// MeasurementTagKeysByExpr returns all the tag keys for the provided expression.
-func (s *Shard) MeasurementTagKeysByExpr(name []byte, expr influxql.Expr) (map[string]struct{}, error) {
-	engine, err := s.Engine()
-	if err != nil {
-		return nil, err
-	}
-	return engine.MeasurementTagKeysByExpr(name, expr)
-}
-
-// MeasurementTagKeyValuesByExpr returns all the tag keys values for the
-// provided expression.
-func (s *Shard) MeasurementTagKeyValuesByExpr(auth query.FineAuthorizer, name []byte, key []string, expr influxql.Expr, keysSorted bool) ([][]string, error) {
-	index, err := s.Index()
-	if err != nil {
-		return nil, err
-	}
-	indexSet := IndexSet{Indexes: []Index{index}, SeriesFile: s.sfile}
-	return indexSet.MeasurementTagKeyValuesByExpr(auth, name, key, expr, keysSorted)
 }
 
 // MeasurementNamesByPredicate returns fields for a measurement filtered by an expression.
@@ -1130,30 +1139,28 @@ func (s *Shard) Export(w io.Writer, basePath string, start time.Time, end time.T
 // Restore restores data to the underlying engine for the shard.
 // The shard is reopened after restore.
 func (s *Shard) Restore(r io.Reader, basePath string) error {
-	if err := func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		// Special case - we can still restore to a disabled shard, so we should
-		// only check if the engine is closed and not care if the shard is
-		// disabled.
-		if s._engine == nil {
-			return ErrEngineClosed
-		}
+	// Special case - we can still restore to a disabled shard, so we should
+	// only check if the engine is closed and not care if the shard is
+	// disabled.
+	if s._engine == nil {
+		return ErrEngineClosed
+	}
 
-		// Restore to engine.
-		return s._engine.Restore(r, basePath)
-	}(); err != nil {
+	// Restore to engine.
+	if err := s._engine.Restore(r, basePath); err != nil {
 		return err
 	}
 
 	// Close shard.
-	if err := s.Close(); err != nil {
+	if err := s.closeNoLock(); err != nil {
 		return err
 	}
 
 	// Reopen engine.
-	return s.Open()
+	return s.openNoLock()
 }
 
 // Import imports data to the underlying engine for the shard. r should
@@ -1686,24 +1693,27 @@ type MeasurementFieldSet struct {
 	mu     sync.RWMutex
 	fields map[string]*MeasurementFields
 	// path is the location to persist field sets
-	path string
-	// ephemeral counters for updating the file on disk
-	memoryVersion  uint64
-	writtenVersion uint64
+	path   string
+	writer *MeasurementFieldSetWriter
 }
 
 // NewMeasurementFieldSet returns a new instance of MeasurementFieldSet.
 func NewMeasurementFieldSet(path string) (*MeasurementFieldSet, error) {
+	const MaxCombinedWrites = 100
 	fs := &MeasurementFieldSet{
-		fields:         make(map[string]*MeasurementFields),
-		path:           path,
-		memoryVersion:  0,
-		writtenVersion: 0,
+		fields: make(map[string]*MeasurementFields),
+		path:   path,
 	}
-
+	fs.SetMeasurementFieldSetWriter(100)
 	// If there is a load error, return the error and an empty set so
 	// it can be rebuild manually.
 	return fs, fs.load()
+}
+
+func (fs *MeasurementFieldSet) Close() {
+	if fs != nil && fs.writer != nil {
+		fs.writer.Close()
+	}
 }
 
 // Bytes estimates the memory footprint of this MeasurementFieldSet, in bytes.
@@ -1783,73 +1793,144 @@ func (fs *MeasurementFieldSet) IsEmpty() bool {
 	return len(fs.fields) == 0
 }
 
-func (fs *MeasurementFieldSet) Save() (err error) {
-	// current version
-	var v uint64
-	// Is the MeasurementFieldSet empty?
-	isEmpty := false
-	// marshaled MeasurementFieldSet
+type errorChannel chan<- error
 
-	b, err := func() ([]byte, error) {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		fs.memoryVersion += 1
-		v = fs.memoryVersion
-		// If no fields left, remove the fields index file
-		if len(fs.fields) == 0 {
-			isEmpty = true
-			if err := os.RemoveAll(fs.path); err != nil {
-				return nil, err
-			} else {
-				fs.writtenVersion = fs.memoryVersion
-				return nil, nil
-			}
-		}
-		return fs.marshalMeasurementFieldSetNoLock()
-	}()
+type writeRequest struct {
+	done errorChannel
+}
 
-	if err != nil {
-		return err
-	} else if isEmpty {
-		return nil
-	}
+type MeasurementFieldSetWriter struct {
+	wg            sync.WaitGroup
+	writeRequests chan writeRequest
+}
 
-	// Write the new index to a temp file and rename when it's sync'd
-	// if it is still the most recent memoryVersion of the MeasurementFields
-	path := fs.path + "." + strconv.FormatUint(v, 10) + ".tmp"
-
-	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL|os.O_SYNC, 0666)
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(path)
-
-	if _, err := fd.Write(fieldsIndexMagicNumber); err != nil {
-		return err
-	}
-
-	if _, err := fd.Write(b); err != nil {
-		return err
-	}
-
-	if err = fd.Sync(); err != nil {
-		return err
-	}
-
-	//close file handle before renaming to support Windows
-	if err = fd.Close(); err != nil {
-		return err
-	}
-
+// SetMeasurementFieldSetWriter - initialize the queue for write requests
+// and start the background write process
+func (fs *MeasurementFieldSet) SetMeasurementFieldSetWriter(queueLength int) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.writer = &MeasurementFieldSetWriter{writeRequests: make(chan writeRequest, queueLength)}
+	fs.writer.wg.Add(1)
+	go fs.saveWriter()
+}
 
-	// Check if a later modification and save of fields has superseded ours
-	// If so, we are successfully done! We were beaten by a later call
-	// to this function
-	if fs.writtenVersion > v {
-		return nil
+func (w *MeasurementFieldSetWriter) Close() {
+	if w != nil {
+		close(w.writeRequests)
 	}
+	w.wg.Wait()
+}
+
+func (fs *MeasurementFieldSet) Save() error {
+	return fs.writer.RequestSave()
+}
+
+func (w *MeasurementFieldSetWriter) RequestSave() error {
+	done := make(chan error)
+	wr := writeRequest{done: done}
+	w.writeRequests <- wr
+	return <-done
+}
+
+func (fs *MeasurementFieldSet) saveWriter() {
+	defer fs.writer.wg.Done()
+	// Block until someone modifies the MeasurementFieldSet and
+	// it needs to be written to disk.
+	for req, ok := <-fs.writer.writeRequests; ok; req, ok = <-fs.writer.writeRequests {
+		fs.writeToFile(req)
+	}
+}
+
+// writeToFile: Write the new index to a temp file and rename when it's sync'd
+func (fs *MeasurementFieldSet) writeToFile(first writeRequest) {
+	var err error
+	// Put the errorChannel on which we blocked into a slice to allow more invocations
+	// to share the return code from the file write
+	errorChannels := []errorChannel{first.done}
+	defer func() {
+		for _, c := range errorChannels {
+			c <- err
+			close(c)
+		}
+	}()
+	// Do some blocking IO operations before marshalling the in-memory index
+	// to allow other changes to it to be queued up and be captured in one
+	// write operation, in case we are under heavy field creation load
+	path := fs.path + ".tmp"
+
+	// Open the temp file
+	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL|os.O_SYNC, 0666)
+	if err != nil {
+		return
+	}
+	// Ensure temp file is cleaned up
+	defer func() {
+		if e := os.RemoveAll(path); err == nil {
+			err = e
+		}
+	}()
+	isEmpty, err := func() (isEmpty bool, err error) {
+		// ensure temp file closed before rename (for Windows)
+		defer func() {
+			if e := fd.Close(); err == nil {
+				err = e
+			}
+		}()
+		if _, err = fd.Write(fieldsIndexMagicNumber); err != nil {
+			return true, err
+		}
+
+		// Read all the pending new field and measurement write requests
+		// that will be captured in the marshaling of the in-memory copy
+		for {
+			select {
+			case ec := <-fs.writer.writeRequests:
+				errorChannels = append(errorChannels, ec.done)
+				continue
+			default:
+			}
+			break
+		}
+		// Lock, copy, and marshal the in-memory index
+		b, err := fs.marshalMeasurementFieldSet()
+		if err != nil {
+			return true, err
+		}
+		if b == nil {
+			// No fields, file removed, all done
+			return true, nil
+		}
+		if _, err := fd.Write(b); err != nil {
+			return true, err
+		}
+		return false, fd.Sync()
+	}()
+	if err != nil || isEmpty {
+		return
+	}
+	err = fs.renameFile(path, err)
+}
+
+// marshalMeasurementFieldSet: remove the fields.idx file if no fields
+// otherwise, copy the in-memory version into a protobuf to write to
+// disk
+func (fs *MeasurementFieldSet) marshalMeasurementFieldSet() ([]byte, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if len(fs.fields) == 0 {
+		// If no fields left, remove the fields index file
+		if err := os.RemoveAll(fs.path); err != nil {
+			return nil, err
+		} else {
+			return nil, nil
+		}
+	}
+	return fs.marshalMeasurementFieldSetNoLock()
+}
+
+func (fs *MeasurementFieldSet) renameFile(path string, err error) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 
 	if err := file.RenameFile(path, fs.path); err != nil {
 		return err
@@ -1858,8 +1939,7 @@ func (fs *MeasurementFieldSet) Save() (err error) {
 	if err = file.SyncDir(filepath.Dir(fs.path)); err != nil {
 		return err
 	}
-	// Update the written version to the current version
-	fs.writtenVersion = v
+
 	return nil
 }
 
@@ -1911,7 +1991,7 @@ func (fs *MeasurementFieldSet) load() error {
 	}
 
 	var pb internal.MeasurementFieldSet
-	b, err := ioutil.ReadAll(fd)
+	b, err := io.ReadAll(fd)
 	if err != nil {
 		return err
 	}

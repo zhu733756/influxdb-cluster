@@ -1,5 +1,277 @@
+v1.8.11-c1.2.0 [2024-09-08]
+-------------------
+
+InfluxDB Cluster v1.8.11-c1.2.0 release
+
+### Features
+
+-	chore: upgrade to go 1.21.13 (and support `GOMEMLIMIT` environment variable to set a soft memory limit includes the Go heap and all other memory managed by the runtime)
+-	feat(gossip): gossip `/announce` will try to request other nodes when network failed
+-	refactor(pool): optimize connection pool to reduce the number of `TCP` and `TIME_WAIT`
+-	refactor(meta-executor): optimize meta executor with connection pool
+-	feat(config): support `shard-reader-timeout` in data node configuration
+-	chore(write): optimize logger output under write `timeout` failed
+
+### Bugfixes
+
+-	fix(cluster): fix nil pointer dereference in marshal binary of join cluster response [#15](https://github.com/chengshiwen/influxdb-cluster/issues/15)
+-	fix(hinted-handoff): fix null pointer from hh caused panic [#28](https://github.com/chengshiwen/influxdb-cluster/pull/28)
+-	fix(hinted-handoff): fix possible deadlock in node_processor [#42](https://github.com/chengshiwen/influxdb-cluster/issues/42)
+-	fix(pool): fix possible deadlock in client_pool
+-	fix(copy-shard): fix read tcp i/o timeout in `copy-shard` [#39](https://github.com/chengshiwen/influxdb-cluster/issues/39)
+-	fix(meta-client): fix data race in meta client
+-	fix(show-shards): remove any expired shards and give empty expiry time for inf duration shards from the `/show-shards` output
+-	fix(influxd): fix influxd close and reset issue
+-	fix(coordinator): fix closing opened twice in points writer
+-	fix(tsm1): Fix data race of seriesKeys in deleteSeriesRange
+-	chore(config): fix indent and typo in config.sample.toml and meta.config.sample.toml
+
+InfluxDB OSS v1.8.11 release
+
+### Features
+
+-	[#24764](https://github.com/influxdata/influxdb/pull/24764): chore: upgrade to influxdata/influxql v1.2.0
+-	[#20793](https://github.com/influxdata/influxdb/pull/20793): feat: Add WITH KEY to show tag keys
+-	[#21983](https://github.com/influxdata/influxdb/pull/21983): feat: SHOW TAG VALUES should produce results from one specific RP
+-	[#22388](https://github.com/influxdata/influxdb/pull/22388): feat: show measurements database and retention policy wildcards
+-	[#22620](https://github.com/influxdata/influxdb/pull/22620): feat: add thread-safe access to CountingWriter byte total
+-	[#22638](https://github.com/influxdata/influxdb/pull/22638): feat: optionally dump queries to log on SIGTERM
+-	[#23055](https://github.com/influxdata/influxdb/pull/23055): feat: configurable DELETE concurrency
+-	[#23320](https://github.com/influxdata/influxdb/pull/23320): feat: log slow queries even without query logging
+-	[#23425](https://github.com/influxdata/influxdb/pull/23425): feat: log the log level regardless of log level
+-	[#23795](https://github.com/influxdata/influxdb/pull/23795): feat: add version number to debug/vars
+-	[#23978](https://github.com/influxdata/influxdb/pull/23978): feat: add the ability to log queries killed by `query-timeout`
+-	[#18146](https://github.com/influxdata/influxdb/pull/18146): refactor(query): reuse matchAllRegex
+-	[#19514](https://github.com/influxdata/influxdb/pull/19514): refactor: Use filepath.Walk
+-	[#19323](https://github.com/influxdata/influxdb/pull/19323): refactor: Use binary.Read() instead of io.ReadFull()
+
+### Bugfixes
+
+-	[#22754](https://github.com/influxdata/influxdb/pull/22754): fix: detect misquoted tag values and return an error
+-	[#17685](https://github.com/influxdata/influxdb/pull/17685): fix(tsm1): Fix temp directory search bug
+-	[#18004](https://github.com/influxdata/influxdb/pull/18004): fix(httpd): Fixes key collisions when serializing /debug/vars
+-	[#18129](https://github.com/influxdata/influxdb/pull/18129): fix(tsdb): Fix variables masked by a declaration
+-	[#18429](https://github.com/influxdata/influxdb/pull/18429): fix(httpd): add option to authenticate prometheus remote read
+-	[#19631](https://github.com/influxdata/influxdb/pull/19631): fix(CORS): allow PATCH
+-	[#20694](https://github.com/influxdata/influxdb/pull/20694): fix: consistent error for missing shard
+-	[#20802](https://github.com/influxdata/influxdb/pull/20802): fix(tsm1): fix data race and validation in cache ring
+-	[#21558](https://github.com/influxdata/influxdb/pull/21558): fix: do not send non-UTF-8 characters to subscriptions
+-	[#21592](https://github.com/influxdata/influxdb/pull/21592): fix: avoid rewriting fields.idx unnecessarily
+-	[#21659](https://github.com/influxdata/influxdb/pull/21659): fix: do not close connection twice in DigestWithOptions
+-	[#21666](https://github.com/influxdata/influxdb/pull/21666): fix: do not panic on cleaning up failed iterators
+-	[#21792](https://github.com/influxdata/influxdb/pull/21792): fix: error instead of panic for statement rewrite failure
+-	[#21795](https://github.com/influxdata/influxdb/pull/21795): fix: show shards gives empty expiry time for inf duration shards
+-	[#22040](https://github.com/influxdata/influxdb/pull/22040): fix: copy names from mmapped memory before closing iterator
+-	[#22038](https://github.com/influxdata/influxdb/pull/22038): test: fix order of index teardown
+-	[#22273](https://github.com/influxdata/influxdb/pull/22273): fix: return correct count of ErrNotExecuted
+-	[#22353](https://github.com/influxdata/influxdb/pull/22353): fix: correct error return shadowing
+-	[#22348](https://github.com/influxdata/influxdb/pull/22348): fix: flux error properly read by cloud
+-	[#22492](https://github.com/influxdata/influxdb/pull/22492): fix: For Windows, close temp file before removing
+-	[#22566](https://github.com/influxdata/influxdb/pull/22566): fix(tsdb): sync series segment to disk after writing
+-	[#22601](https://github.com/influxdata/influxdb/pull/22601): fix: create shards without overlaps
+-	[#22661](https://github.com/influxdata/influxdb/pull/22661): chore: fix deadlock in `influx_inspect dumptsi`
+-	[#22703](https://github.com/influxdata/influxdb/pull/22703): fix: extend snapshot copy to filesystems that cannot link
+-	[#22796](https://github.com/influxdata/influxdb/pull/22796): fix(restore): fix race condition which causes restore command to fail
+-	[#21932](https://github.com/influxdata/influxdb/pull/21932): fix(tsi): sync index file before close
+-	[#22929](https://github.com/influxdata/influxdb/pull/22929): fix: use defer for unlock
+-	[#22998](https://github.com/influxdata/influxdb/pull/22998): fix: `influxd-ctl backup` will create a working backup when only `-shard` given
+-	[#23217](https://github.com/influxdata/influxdb/pull/23217): fix: return underlying error creating a subscription
+-	[#23197](https://github.com/influxdata/influxdb/pull/23197): fix(influx_inspect): multiple retention policies bug in influx_inspect export
+-	[#21125](https://github.com/influxdata/influxdb/pull/21125): chore: fix typo in config.sample.toml
+-	[#21746](https://github.com/influxdata/influxdb/pull/21746): fix(httpd): abort processing write request when encountering a precision error
+-	[#23286](https://github.com/influxdata/influxdb/pull/23286): fix: MeasurementsCardinality should not be less than 0
+-	[#23336](https://github.com/influxdata/influxdb/pull/23336): fix: remove data directory appending for influx_inspect verify
+-	[#23387](https://github.com/influxdata/influxdb/pull/23387): fix: replace unprintable and invalid characters in errors
+-	[#23396](https://github.com/influxdata/influxdb/pull/23396): fix: do not rename files on mmap failure
+-	[#23430](https://github.com/influxdata/influxdb/pull/23430): fix: fully clean up partially opened TSI
+-	[#23437](https://github.com/influxdata/influxdb/pull/23437): fix: remember shards that fail Open(), avoid repeated attempts
+-	[#23461](https://github.com/influxdata/influxdb/pull/23461): fix: lost TSI reference / close TagValueSeriesIDIterator in error case
+-	[#23467](https://github.com/influxdata/influxdb/pull/23467): fix: eliminate race condition on Monitor.globalTags
+-	[#23532](https://github.com/influxdata/influxdb/pull/23532): fix: improve error messages opening index partitions
+-	[#23539](https://github.com/influxdata/influxdb/pull/23539): fix: create TSI MANIFEST files atomically
+-	[#23557](https://github.com/influxdata/influxdb/pull/23557): fix: add paths to tsi log and index file errors
+-	[#23566](https://github.com/influxdata/influxdb/pull/23566): fix: add reporttsi to the help text
+-	[#23580](https://github.com/influxdata/influxdb/pull/23580): fix: generalize test for Windows
+-	[#23785](https://github.com/influxdata/influxdb/pull/23785): fix: use copy when a rename spans volumes
+-	[#23787](https://github.com/influxdata/influxdb/pull/23787): fix: add tests for file rename across volumes
+-	[#23822](https://github.com/influxdata/influxdb/pull/23822): fix: log errors in continuous query statistics storage
+-	[#23727](https://github.com/influxdata/influxdb/pull/23727): fix: don't write skipped shard messages to the line protocol output destination
+-	[#23916](https://github.com/influxdata/influxdb/pull/23916): fix: series file index compaction
+-	[#24311](https://github.com/influxdata/influxdb/pull/24311): fix: do not escape CSV output
+-	[#24509](https://github.com/influxdata/influxdb/pull/24509): fix: avoid SIGBUS when reading non-std series segment files
+-	[#24565](https://github.com/influxdata/influxdb/pull/24565): fix: panic index out of range for invalid series keys
+-	[#24784](https://github.com/influxdata/influxdb/pull/24784): fix: do not panic when empty tags are queried
+-	[#24602](https://github.com/influxdata/influxdb/pull/24602): fix: improved shard deletion
+-	[#24957](https://github.com/influxdata/influxdb/pull/24957): fix: ensure TSMBatchKeyIterator and FileStore close all TSMReaders
+-	[#24975](https://github.com/influxdata/influxdb/pull/24975): fix: return MergeIterator.Close errors
+-	[#25037](https://github.com/influxdata/influxdb/pull/25037): fix: ignore empty index error deleting last measurement
+-	[#25082](https://github.com/influxdata/influxdb/pull/25082): fix: GROUP BY queries with offset that crosses a DST boundary fail.
+-	[#25146](https://github.com/influxdata/influxdb/pull/25146): fix: Store.validateArgs wrongfully overwriting start, end unix time
+-	[#25182](https://github.com/influxdata/influxdb/pull/25182): fix(tsi1): fix data race between appendEntry and FlushAndSync tsi1.(*LogFile)
+-	[#22283](https://github.com/influxdata/influxdb/pull/22283): fix: require database authorization to see continuous queries
+
+**Note**: Why does [v1.8.11](https://github.com/chengshiwen/influxdb/tree/1.8.11) exist?
+
+> Because [v1.8.10](https://github.com/influxdata/influxdb/tree/v1.8.10) is the last version of 1.8 and has been out of maintenance for a long time.
+> [v1.8.11](https://github.com/chengshiwen/influxdb/tree/1.8.11) is based on [v1.8.10](https://github.com/influxdata/influxdb/tree/v1.8.10), and applied important bug fixes from [1.9](https://github.com/influxdata/influxdb/tree/1.9) to [1.11](https://github.com/influxdata/influxdb/tree/1.11). For details of the commits, see https://github.com/chengshiwen/influxdb/compare/v1.8.10...1.8.11
+
+v1.8.10-c1.1.2 [2022-12-11]
+-------------------
+
+### Features
+
+-	feat(flux): support [flux query language](https://docs.influxdata.com/influxdb/v1.8/flux/) in cluster
+-	chore(influxd-ctl): optimize `shard not found` tips in `influxd-ctl show-shards`
+-	chore(monitor): optimize `nodeID` value to tcp addr in statistics
+
+### Bugfixes
+
+-	fix(influxql): fix `show queries` and `kill query` statement in cluster
+-	fix(influxql): fix `explain` and `explain analyze` statement in cluster
+-	fix(influxql): fix `show measurement cardinality` and `show series cardinality` statement in cluster
+
+**Note**: All influxql ([influx query language](https://docs.influxdata.com/influxdb/v1.8/query_language/)) statements are already supported in cluster.
+
+v1.8.10-c1.1.1 [2022-10-16]
+-------------------
+
+### Features
+
+-	feat(config): support `allow-out-of-order-writes` and `max-writes-pending` in data node configuration
+-	chore: update raft to v1.3.11
+
+### Bugfixes
+
+-	fix(meta-handler): announcement concurrent map iteration and map write in meta handler
+-	fix(hinted-handoff): optimize the load order of segments in hh
+-	fix(hinted-handoff): optimize marshalWrite and unmarshalWrite in node processor
+-	fix(hinted-handoff): do not queue partial write errors to hinted handoff
+-	fix(hinted-handoff): prevent the hinted handoff from becoming blocked if it encounters field type errors
+-	fix(hinted-handoff): fix issue where read bytes, blocked writes and dropped writes were not recorded in hh
+-	fix(hinted-handoff): ensure the hinted handoff (hh) queue makes forward progress when segment errors occur
+-	fix(hinted-handoff): verify and truncate the queue segment files if any are corrupted upon node startup
+-	fix(hinted-handoff): improve hinted handoff metrics
+-	fix(hinted-handoff): append bytes to buffer in hh queue to avoid OOM
+
+v1.8.10-c1.1.0 [2022-09-19]
+-------------------
+
+### Features
+
+-	feat(influxd-ctl): support `-auth-type`, `-pwd`, `-secret` and `-user` global options
+-	feat(influxd-ctl): support `copy-shard`, `join`, `leave`, `remove-shard`, `show-shards`, `token` and `truncate-shards` commands
+-	feat(influxd-ctl): remove-data: remove data directory after data node removed
+-	feat(influxd-ctl): remove-meta: remove meta directory after meta node removed
+-	feat(influxd-ctl): show: display `version` column with health check
+-	feat(config): support 19 settings in meta and data node configuration
+-	feat(https): support https and authorization in meta and data node
+-	feat(auth): support jwt and basic authentication in meta and data node
+-	feat(gossip): support gossip announcement in influxd-meta and influxd
+-	feat(query): skip failed nodes that hold a shard needed for queries (if there is a replica on another node, it will retry on that node)
+-	feat(hinted-handoff): refactor hinted handoff to ensure purge data under node/shard/segment directory structure
+-	feat(hinted-handoff): remove hinted handoff queues when data nodes are removed to eliminate manual cleanup tasks
+-	feat(chronograf): compat chronograf access via `/user` and `/role` interface in meta service
+-	feat(pool): improve connection pool in shard writer and meta executor
+
+### Bugfixes
+
+-	fix(influx_inspect): multiple retention policies problem in influx_inspect export [#23197](https://github.com/influxdata/influxdb/pull/23197)
+-	fix(iterator): float, integer, string and boolean iterator finalized by GC
+-	fix(query): `show measurements`, `show tag keys`, `show tag values`, `show field keys` and `show series` only query local data
+-	fix(query): `node_id` not workding in `/query`
+-	fix(hinted-handoff): segment is full
+
+v1.8.10-c1.0.0 [2022-04-20]
+-------------------
+
+### Features
+
+-	Release InfluxDB Cluster based on [InfluxDB Enterprise](https://docs.influxdata.com/enterprise_influxdb/v1.8/), [InfluxDB v1.8.10](https://github.com/influxdata/influxdb/tree/v1.8.10) and [InfluxDB v0.11.1](https://github.com/influxdata/influxdb/tree/v0.11.1)
+
 v1.8.11 [unreleased]
 -------------------
+
+### Features
+
+-	[#24764](https://github.com/influxdata/influxdb/pull/24764): chore: upgrade to influxdata/influxql v1.2.0
+-	[#20793](https://github.com/influxdata/influxdb/pull/20793): feat: Add WITH KEY to show tag keys
+-	[#21983](https://github.com/influxdata/influxdb/pull/21983): feat: SHOW TAG VALUES should produce results from one specific RP
+-	[#22388](https://github.com/influxdata/influxdb/pull/22388): feat: show measurements database and retention policy wildcards
+-	[#22620](https://github.com/influxdata/influxdb/pull/22620): feat: add thread-safe access to CountingWriter byte total
+-	[#22638](https://github.com/influxdata/influxdb/pull/22638): feat: optionally dump queries to log on SIGTERM
+-	[#23055](https://github.com/influxdata/influxdb/pull/23055): feat: configurable DELETE concurrency
+-	[#23320](https://github.com/influxdata/influxdb/pull/23320): feat: log slow queries even without query logging
+-	[#23425](https://github.com/influxdata/influxdb/pull/23425): feat: log the log level regardless of log level
+-	[#23795](https://github.com/influxdata/influxdb/pull/23795): feat: add version number to debug/vars
+-	[#23978](https://github.com/influxdata/influxdb/pull/23978): feat: add the ability to log queries killed by `query-timeout`
+-	[#18146](https://github.com/influxdata/influxdb/pull/18146): refactor(query): reuse matchAllRegex
+-	[#19514](https://github.com/influxdata/influxdb/pull/19514): refactor: Use filepath.Walk
+-	[#19323](https://github.com/influxdata/influxdb/pull/19323): refactor: Use binary.Read() instead of io.ReadFull()
+
+### Bugfixes
+
+-	[#22754](https://github.com/influxdata/influxdb/pull/22754): fix: detect misquoted tag values and return an error
+-	[#17685](https://github.com/influxdata/influxdb/pull/17685): fix(tsm1): Fix temp directory search bug
+-	[#18004](https://github.com/influxdata/influxdb/pull/18004): fix(httpd): Fixes key collisions when serializing /debug/vars
+-	[#18129](https://github.com/influxdata/influxdb/pull/18129): fix(tsdb): Fix variables masked by a declaration
+-	[#18429](https://github.com/influxdata/influxdb/pull/18429): fix(httpd): add option to authenticate prometheus remote read
+-	[#19631](https://github.com/influxdata/influxdb/pull/19631): fix(CORS): allow PATCH
+-	[#20694](https://github.com/influxdata/influxdb/pull/20694): fix: consistent error for missing shard
+-	[#20802](https://github.com/influxdata/influxdb/pull/20802): fix(tsm1): fix data race and validation in cache ring
+-	[#21558](https://github.com/influxdata/influxdb/pull/21558): fix: do not send non-UTF-8 characters to subscriptions
+-	[#21592](https://github.com/influxdata/influxdb/pull/21592): fix: avoid rewriting fields.idx unnecessarily
+-	[#21659](https://github.com/influxdata/influxdb/pull/21659): fix: do not close connection twice in DigestWithOptions
+-	[#21666](https://github.com/influxdata/influxdb/pull/21666): fix: do not panic on cleaning up failed iterators
+-	[#21792](https://github.com/influxdata/influxdb/pull/21792): fix: error instead of panic for statement rewrite failure
+-	[#21795](https://github.com/influxdata/influxdb/pull/21795): fix: show shards gives empty expiry time for inf duration shards
+-	[#22040](https://github.com/influxdata/influxdb/pull/22040): fix: copy names from mmapped memory before closing iterator
+-	[#22038](https://github.com/influxdata/influxdb/pull/22038): test: fix order of index teardown
+-	[#22273](https://github.com/influxdata/influxdb/pull/22273): fix: return correct count of ErrNotExecuted
+-	[#22353](https://github.com/influxdata/influxdb/pull/22353): fix: correct error return shadowing
+-	[#22348](https://github.com/influxdata/influxdb/pull/22348): fix: flux error properly read by cloud
+-	[#22492](https://github.com/influxdata/influxdb/pull/22492): fix: For Windows, close temp file before removing
+-	[#22566](https://github.com/influxdata/influxdb/pull/22566): fix(tsdb): sync series segment to disk after writing
+-	[#22601](https://github.com/influxdata/influxdb/pull/22601): fix: create shards without overlaps
+-	[#22661](https://github.com/influxdata/influxdb/pull/22661): chore: fix deadlock in `influx_inspect dumptsi`
+-	[#22703](https://github.com/influxdata/influxdb/pull/22703): fix: extend snapshot copy to filesystems that cannot link
+-	[#22796](https://github.com/influxdata/influxdb/pull/22796): fix(restore): fix race condition which causes restore command to fail
+-	[#21932](https://github.com/influxdata/influxdb/pull/21932): fix(tsi): sync index file before close
+-	[#22929](https://github.com/influxdata/influxdb/pull/22929): fix: use defer for unlock
+-	[#22998](https://github.com/influxdata/influxdb/pull/22998): fix: `influxd-ctl backup` will create a working backup when only `-shard` given
+-	[#23217](https://github.com/influxdata/influxdb/pull/23217): fix: return underlying error creating a subscription
+-	[#23197](https://github.com/influxdata/influxdb/pull/23197): fix(influx_inspect): multiple retention policies bug in influx_inspect export
+-	[#21125](https://github.com/influxdata/influxdb/pull/21125): chore: fix typo in config.sample.toml
+-	[#21746](https://github.com/influxdata/influxdb/pull/21746): fix(httpd): abort processing write request when encountering a precision error
+-	[#23286](https://github.com/influxdata/influxdb/pull/23286): fix: MeasurementsCardinality should not be less than 0
+-	[#23336](https://github.com/influxdata/influxdb/pull/23336): fix: remove data directory appending for influx_inspect verify
+-	[#23387](https://github.com/influxdata/influxdb/pull/23387): fix: replace unprintable and invalid characters in errors
+-	[#23396](https://github.com/influxdata/influxdb/pull/23396): fix: do not rename files on mmap failure
+-	[#23430](https://github.com/influxdata/influxdb/pull/23430): fix: fully clean up partially opened TSI
+-	[#23437](https://github.com/influxdata/influxdb/pull/23437): fix: remember shards that fail Open(), avoid repeated attempts
+-	[#23461](https://github.com/influxdata/influxdb/pull/23461): fix: lost TSI reference / close TagValueSeriesIDIterator in error case
+-	[#23467](https://github.com/influxdata/influxdb/pull/23467): fix: eliminate race condition on Monitor.globalTags
+-	[#23532](https://github.com/influxdata/influxdb/pull/23532): fix: improve error messages opening index partitions
+-	[#23539](https://github.com/influxdata/influxdb/pull/23539): fix: create TSI MANIFEST files atomically
+-	[#23557](https://github.com/influxdata/influxdb/pull/23557): fix: add paths to tsi log and index file errors
+-	[#23566](https://github.com/influxdata/influxdb/pull/23566): fix: add reporttsi to the help text
+-	[#23580](https://github.com/influxdata/influxdb/pull/23580): fix: generalize test for Windows
+-	[#23785](https://github.com/influxdata/influxdb/pull/23785): fix: use copy when a rename spans volumes
+-	[#23787](https://github.com/influxdata/influxdb/pull/23787): fix: add tests for file rename across volumes
+-	[#23822](https://github.com/influxdata/influxdb/pull/23822): fix: log errors in continuous query statistics storage
+-	[#23727](https://github.com/influxdata/influxdb/pull/23727): fix: don't write skipped shard messages to the line protocol output destination
+-	[#23916](https://github.com/influxdata/influxdb/pull/23916): fix: series file index compaction
+-	[#24311](https://github.com/influxdata/influxdb/pull/24311): fix: do not escape CSV output
+-	[#24509](https://github.com/influxdata/influxdb/pull/24509): fix: avoid SIGBUS when reading non-std series segment files
+-	[#24565](https://github.com/influxdata/influxdb/pull/24565): fix: panic index out of range for invalid series keys
+-	[#24784](https://github.com/influxdata/influxdb/pull/24784): fix: do not panic when empty tags are queried
+-	[#24602](https://github.com/influxdata/influxdb/pull/24602): fix: improved shard deletion
+-	[#24957](https://github.com/influxdata/influxdb/pull/24957): fix: ensure TSMBatchKeyIterator and FileStore close all TSMReaders
+-	[#24975](https://github.com/influxdata/influxdb/pull/24975): fix: return MergeIterator.Close errors
+-	[#25037](https://github.com/influxdata/influxdb/pull/25037): fix: ignore empty index error deleting last measurement
+-	[#25082](https://github.com/influxdata/influxdb/pull/25082): fix: GROUP BY queries with offset that crosses a DST boundary fail.
+-	[#25146](https://github.com/influxdata/influxdb/pull/25146): fix: Store.validateArgs wrongfully overwriting start, end unix time
+-	[#25182](https://github.com/influxdata/influxdb/pull/25182): fix(tsi1): fix data race between appendEntry and FlushAndSync tsi1.(*LogFile)
+-	[#22283](https://github.com/influxdata/influxdb/pull/22283): fix: require database authorization to see continuous queries
 
 v1.8.10 [2021-10-11]
 -------------------
